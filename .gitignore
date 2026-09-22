@@ -1,0 +1,37 @@
+# Terraform state holds the database password in CLEARTEXT.
+#
+# `db_password` is marked sensitive in variables.tf, which controls whether
+# Terraform prints it — not whether it stores it. The kubernetes_secret
+# resource records POSTGRES_PASSWORD under `data` in plain text, and
+# .tfstate.backup keeps the previous copy, so a `terraform destroy` does not
+# clean it up. Committing either file publishes the credential.
+#
+# This is the one file in the repo that exists to prevent a mistake rather than
+# to enable something.
+terraform.tfstate
+terraform.tfstate.*
+*.tfstate
+*.tfstate.*
+
+# Plan files embed variable values, including the password.
+*.tfplan
+tfplan*
+
+# Variable files: the repo passes db_password from a Harness secret, so there
+# should be no reason to have these. If one appears locally, it is holding
+# something that does not belong in git.
+*.tfvars
+*.tfvars.json
+
+# Provider binaries and local backend scratch. .terraform.lock.hcl is NOT
+# ignored — that one belongs in git, so every run resolves the same provider
+# versions.
+.terraform/
+.terraform.tfstate.lock.info
+
+# The real backend config, copied from backend-kubernetes.tf.example by the
+# provision stage. Ignored so a local apply keeps using local state.
+backend-kubernetes.tf
+
+.DS_Store
+BLOG.md

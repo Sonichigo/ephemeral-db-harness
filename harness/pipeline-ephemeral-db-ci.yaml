@@ -1,0 +1,563 @@
+pipeline:
+  name: Ephemeral DB CI
+  identifier: ephemeral_db_ci
+  projectIdentifier: <<PROJECT_ID>>
+  orgIdentifier: <<ORG_ID>>
+  tags: {}
+
+  # No properties.ci.codebase block here, deliberately. It only takes effect for
+  # CI (Build) stages, and this pipeline has none — stage 2 is a Custom stage.
+  # Setting it would look like the repository was available on disk when it was
+  # not. The GitClone step in stage 2 does that job explicitly.
+
+  variables:
+    # Flyway or Liquibase. The migrations themselves are shared: Liquibase runs
+    # the same sql/migrations files through sql/db.changelog-master.xml, so both
+    # tools apply byte-identical SQL and the broken-migration demo fails the
+    # same way under either. Only the DBSchemaApply step differs, because
+    # migrationType is fixed on the DB Schema and cannot be an expression —
+    # which is why there are two schemas, two instances, and two steps.
+    - name: MIGRATION_TOOL
+      type: String
+      description: "Flyway or Liquibase. Selects which DBSchemaApply step runs."
+      required: true
+      value: <+input>.default(Flyway).allowedValues(Flyway,Liquibase)
+
+    # Leave empty unless your egress goes through a TLS-inspecting proxy — the
+    # kind of corporate MITM appliance that presents its own certificate for
+    # every HTTPS host it re-signs. Your laptop and your delegate host
+    # trust the proxy's root CA because someone installed it there; a build
+    # container starts from the image's CA bundle and does not, so
+    # `terraform init` dies reaching registry.terraform.io with:
+    #
+    #   Failed to query available provider packages
+    #   ... tls: failed to verify certificate: x509: certificate signed by
+    #   unknown authority
+    #
+    # which reads like a Terraform or registry problem and is neither. Image
+    # pulls and git clone keep working, because the kubelet and the Harness
+    # steps use hosts and images that already trust the proxy — so only the
+    # Terraform steps fail, which points suspicion in the wrong direction.
+    #
+    # Base64, not raw PEM: a multi-line value would have to survive expression
+    # substitution into a shell script intact. Set it to a secret expression,
+    # e.g. <+secrets.getValue("custom_ca_pem_b64")>, holding the output of
+    #   base64 < your-root-ca.pem | tr -d '\n'
+    - name: CUSTOM_CA_PEM_B64
+      type: String
+      description: "Optional. Base64 of a PEM CA bundle to trust, for TLS-inspecting proxies. Empty means no-op."
+      required: false
+      value: ""
+
+  stages:
+    ###########################################################################
+    # STAGE 1 — Provision a database that did not exist 60 seconds ago.
+    #
+    # This runs Terraform in a build pod inside the target cluster, using the
+    # pod's own ServiceAccount token. It is NOT an IaCM stage, and that is a
+    # deliberate correction rather than a simplification.
+    #
+    # IaCM cannot do this job against a private cluster. Its runtime enum
+    # accepts exactly two values, Cloud and Docker. Cloud runners execute on
+    # Harness-hosted infrastructure outside your network and cannot reach an
+    # in-cluster API server. Docker runs on the delegate host, which needs a
+    # usable Docker daemon that a Kubernetes delegate does not have, and even
+    # then it is a container on the host rather than a pod, so it inherits no
+    # in-cluster identity. Neither reaches the cluster the way the provider in
+    # main.tf expects. See ISSUES.md, issue 6.
+    #
+    # If your cluster's API server IS reachable from Harness Cloud, the
+    # original IaCM stages are preserved verbatim in
+    # harness/iacm-stages.yaml.example and are a drop-in replacement for this
+    # stage and stage 3. You gain the Resources tab, drift detection and cost
+    # estimation; you need a reachable endpoint and credentials in the
+    # workspace to get them.
+    #
+    # Prerequisite: terraform/bootstrap/provisioner-rbac.yaml, applied once by
+    # a cluster admin. It grants this build pod's ServiceAccount the access
+    # the Terraform needs. Without it the apply fails Forbidden on the first
+    # namespace it tries to create.
+    ###########################################################################
+    - stage:
+        name: Provision Ephemeral DB
+        identifier: provision_ephemeral_db
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Provision
+                  identifier: provision
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <<K8S_CONNECTOR>>
+                      namespace: <<HARNESS_BUILD_NAMESPACE>>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase
+                        spec:
+                          connectorRef: <<GIT_CONNECTOR>>
+                          repoName: <<REPO_NAME>>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+input>
+                        timeout: 5m
+
+                    - step:
+                        type: Run
+                        name: Terraform Apply
+                        identifier: terraform_apply
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          # 1.5.7 is the last MPL-licensed release. 1.6.0+ is
+                          # BSL and not supported here; OpenTofu works too.
+                          image: hashicorp/terraform:1.5.7
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            TF_IN_AUTOMATION: "true"
+                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
+                            TF_VAR_namespace: <<DB_NAMESPACE>>
+                            TF_VAR_build_namespace: <<HARNESS_BUILD_NAMESPACE>>
+                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
+                          command: |
+                            set -e
+
+                            # No-op unless CUSTOM_CA_PEM_B64 is set — see the
+                            # pipeline variable for why this exists.
+                            if [ -n "${CUSTOM_CA_PEM_B64:-}" ]; then
+                              echo "$CUSTOM_CA_PEM_B64" | base64 -d \
+                                >> /etc/ssl/certs/ca-certificates.crt
+                              echo "Added a custom CA to the trust store."
+                            fi
+
+                            cd <<REPO_NAME>>/terraform
+
+                            # Remote state in a Secret, so stage 3 can destroy
+                            # what this stage created. Without it, destroy plans
+                            # against empty state, reports no changes, exits
+                            # green, and leaks the database.
+                            cp backend-kubernetes.tf.example backend-kubernetes.tf
+
+                            terraform init -input=false
+                            terraform apply -input=false -auto-approve
+
+                            echo "--- outputs ---"
+                            terraform output
+                        timeout: 15m
+                        # Back-to-back runs race the previous run's teardown:
+                        # deleting a namespace is asynchronous, so this apply
+                        # can arrive while the old one is still Terminating and
+                        # fail with "object is being deleted". Retrying is the
+                        # whole fix — the namespace finishes terminating within
+                        # seconds.
+                        failureStrategies:
+                          - onFailure:
+                              errors:
+                                - AllErrors
+                              action:
+                                type: Retry
+                                spec:
+                                  retryCount: 3
+                                  retryIntervals:
+                                    - 30s
+                                    - 60s
+                                    - 120s
+                                  onRetryFailure:
+                                    action:
+                                      type: MarkAsFailure
+    ###########################################################################
+    # STAGE 2 — Prove the migration against that database.
+    #
+    # Containerized step group so DB DevOps and the psql steps run inside the
+    # cluster, where the Service DNS name resolves.
+    #
+    # The step group opens with an explicit GitClone. DBSchemaApply brings its
+    # own checkout of the DB Schema's repository as a built-in substep, but the
+    # psql steps here are plain Run steps in a Custom stage and get nothing —
+    # without the clone they fail on a missing sql/ directory.
+    #
+    # ON connectorRef: every container step needs one. Under Kubernetes build
+    # infrastructure it is mandatory — omitting it fails schema validation, and
+    # for DBSchemaApply it fails again at runtime with a different message. It
+    # must NOT be account.harnessImage: that connector points at Harness's own
+    # Artifact Registry, which hosts Harness's first-party step images and not
+    # postgres or alpine/k8s. Pointing at it rewrites every image to
+    # us-docker.pkg.dev/gar-prod-setup/harness-public/<image> and every pod
+    # lands in ImagePullBackOff with "manifest unknown". Use a real registry
+    # connector — see ISSUES.md, issue 2.
+    ###########################################################################
+    - stage:
+        name: Migrate and Verify
+        identifier: migrate_and_verify
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Ephemeral DB Checks
+                  identifier: ephemeral_db_checks
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <<K8S_CONNECTOR>>
+                      namespace: <<HARNESS_BUILD_NAMESPACE>>
+                  steps:
+
+                    # ---- 0. Get the SQL onto disk ----
+                    # Clones into /harness/<<REPO_NAME>>/, NOT into /harness.
+                    # The working directory stays /harness, so every step below
+                    # that reads repo files has to cd into the clone first.
+                    # cloneDirectory: /harness is rejected outright ("/harness
+                    # is an invalid value"), so the cd is the fix. Get this
+                    # wrong and the failure surfaces two steps later as
+                    # "psql: sql/migrations/V1__baseline.sql: No such file or
+                    # directory", while this step still shows green.
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase
+                        spec:
+                          connectorRef: <<GIT_CONNECTOR>>
+                          repoName: <<REPO_NAME>>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+input>
+                        timeout: 5m
+
+                    # ---- 1. Wake the database and wait for it ----
+                    # If the idle reaper scaled it to zero, scale it back up.
+                    # Because the database is stateless, coming back from zero
+                    # yields an empty Postgres — which is exactly what we want
+                    # anyway. Then stamp the heartbeat the reaper reads.
+                    #
+                    # Image note: this was bitnami/kubectl:1.30, which no
+                    # longer exists — Bitnami retired its free Docker Hub
+                    # catalog, so that tag now fails to pull entirely.
+                    #
+                    # RBAC note: this step needs get, list, watch and patch on
+                    # deployments plus update on deployments/scale, in the
+                    # DATABASE namespace, for the BUILD namespace's
+                    # ServiceAccount. rollout status opens a watch rather than
+                    # polling, and a watch on a named resource still needs list
+                    # on the collection. terraform/build-access.tf grants
+                    # exactly that set.
+                    - step:
+                        type: Run
+                        name: Wake And Wait For DB
+                        identifier: wake_and_wait
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          image: alpine/k8s:1.30.0
+                          shell: Sh
+                          # IfNotPresent, not Always: five steps here pull from
+                          # the same registry on every run, and anonymous
+                          # Docker Hub rate-limits per source IP across the
+                          # whole cluster.
+                          imagePullPolicy: IfNotPresent
+                          command: |
+                            set -eu
+                            NS=<<DB_NAMESPACE>>
+
+                            REPLICAS=$(kubectl get deploy ephemeral-db -n "$NS" \
+                              -o jsonpath='{.spec.replicas}')
+                            if [ "$REPLICAS" = "0" ]; then
+                              echo "Reaper had scaled this to zero. Waking it."
+                              kubectl scale deploy ephemeral-db -n "$NS" --replicas=1
+                            fi
+
+                            # Heartbeat. Without this the reaper eventually
+                            # scales the database out from under a long pipeline.
+                            kubectl annotate deploy ephemeral-db -n "$NS" \
+                              "harness.io/last-used=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                              --overwrite
+
+                            kubectl rollout status deploy/ephemeral-db -n "$NS" --timeout=180s
+                            echo "Database is up."
+                        timeout: 10m
+
+                    # ---- 2. Confirm it accepts connections ----
+                    - step:
+                        type: Run
+                        name: Wait For DB Ready
+                        identifier: wait_for_db
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          image: postgres:16.4
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            PGHOST: <<DB_HOST>>
+                            PGUSER: ci
+                            PGDATABASE: app_test
+                            PGPASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                          command: |
+                            set -e
+                            for i in $(seq 1 40); do
+                              if pg_isready -q; then
+                                echo "Database is accepting connections."
+                                exit 0
+                              fi
+                              sleep 3
+                            done
+                            echo "Database never became ready."
+                            exit 1
+                        timeout: 5m
+
+                    # ---- 3. Build a production-shaped database ----
+                    # V1 stands in for "whatever production looks like today",
+                    # and the seed rows are what make the exercise worth doing:
+                    # a migration tested against an empty database tests almost
+                    # nothing.
+                    #
+                    # V1 is applied here with psql rather than through DB
+                    # DevOps, which leaves the schema populated but with no
+                    # migration history table. Both tools have to be told how to
+                    # cope with that, in different ways — see the two apply
+                    # steps below.
+                    - step:
+                        type: Run
+                        name: Load Baseline And Seed Data
+                        identifier: load_seed
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          image: postgres:16.4
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            PGHOST: <<DB_HOST>>
+                            PGUSER: ci
+                            PGDATABASE: app_test
+                            PGPASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                          command: |
+                            set -e
+                            cd <<REPO_NAME>>
+                            psql -v ON_ERROR_STOP=1 -q -f sql/migrations/V1__baseline.sql
+                            psql -v ON_ERROR_STOP=1 -q -f sql/seed/seed.sql
+                            echo "Baseline schema and seed rows loaded:"
+                            psql -c "SELECT count(*) AS seeded_orders FROM orders;"
+                        timeout: 10m
+
+                    # ---- 4a. Apply the migration under test — Flyway ----
+                    # Governance, changelog tracking, and the migration state
+                    # dashboard all come from running it through this step
+                    # rather than shelling out to flyway directly.
+                    #
+                    # baselineOnMigrate is load-bearing, not a workaround. The
+                    # previous step created the baseline tables with psql, so
+                    # Flyway meets a non-empty schema with no history table and
+                    # would otherwise abort. With it set, Flyway writes the
+                    # history table with a baseline marker at baselineVersion
+                    # (1 by default), treats V1 as already applied, and starts
+                    # at V2 — which is exactly the migration under review.
+                    #
+                    # Keep V1 numbered 1 for that reason. If the baseline ever
+                    # spans several files, raise baselineVersion to match the
+                    # highest of them, or the pipeline will replay them and fail
+                    # on objects that already exist.
+                    #
+                    # No `tag` here. Tag is a Liquibase concept and Flyway has
+                    # no equivalent, so supplying it fails the whole pipeline at
+                    # plan creation with "Tag is not supported for flyway
+                    # migration type" — before any stage runs. Flyway's own
+                    # flyway_schema_history is the audit trail.
+                    - step:
+                        type: DBSchemaApply
+                        # Step names are validated against
+                        # ^[a-zA-Z_][-0-9a-zA-Z_\s]{0,127}$ — no parentheses,
+                        # no colons. "Apply Schema (Flyway)" is rejected.
+                        name: Apply Schema Flyway
+                        identifier: apply_schema_flyway
+                        when:
+                          stageStatus: Success
+                          condition: <+pipeline.variables.MIGRATION_TOOL> == "Flyway"
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          migrationType: Flyway
+                          globalSettings:
+                            baselineOnMigrate: "true"
+                          dbSchema: <<DB_SCHEMA_FLYWAY>>
+                          dbInstance: <<DB_INSTANCE_FLYWAY>>
+                        timeout: 15m
+
+                    # ---- 4b. Apply the migration under test — Liquibase ----
+                    # Same SQL, same seeded database, same verdict. The
+                    # changelog at sql/db.changelog-master.xml points <sqlFile>
+                    # at sql/migrations/, so there is no second copy of the
+                    # migration to keep in sync.
+                    #
+                    # No baselineOnMigrate equivalent is needed: the baseline
+                    # changeset carries a preCondition with onFail="MARK_RAN"
+                    # that checks whether `orders` already exists. If the psql
+                    # step got there first, Liquibase records V1 as applied
+                    # without running it and proceeds to V2. Unlike
+                    # baselineOnMigrate, the same changelog also works against a
+                    # genuinely empty database, where the precondition passes and
+                    # V1 runs for real.
+                    #
+                    # This is a Run step and not DBSchemaApply, which is a
+                    # concession to a platform bug rather than a preference.
+                    # DBSchemaApply with migrationType: Liquibase fails at
+                    # runtime with "Unable to fetch port details": the wrapper
+                    # spawns an "Import ChangeSets" sub-step that the
+                    # Initialize step never allocated a container for, so the
+                    # step cannot start. It reproduces with and without `tag`
+                    # and with a single unconditional step, and DBSchemaApply
+                    # is not in the CI stage's step enum, so a Custom-stage
+                    # step group is the only context available. See ISSUES.md,
+                    # issue 13. Switch this back to DBSchemaApply — the
+                    # commented block in that issue — once Harness fixes it,
+                    # and the Liquibase path regains the migration dashboard
+                    # and governance that the Flyway path already has.
+                    #
+                    # The DB Schema and Instance are still worth creating: they
+                    # cost nothing, and they are what a fixed DBSchemaApply
+                    # would use.
+                    - step:
+                        type: Run
+                        name: Apply Schema Liquibase
+                        identifier: apply_schema_liquibase
+                        when:
+                          stageStatus: Success
+                          condition: <+pipeline.variables.MIGRATION_TOOL> == "Liquibase"
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          image: liquibase/liquibase:4.29
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            LB_PASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                          command: |
+                            set -e
+                            cd <<REPO_NAME>>
+
+                            # searchPath is the repo root and the changelog is
+                            # named relative to it. Liquibase 4.x refuses an
+                            # absolute changelog path outside the search path,
+                            # so this pairing is not optional.
+                            liquibase \
+                              --url="jdbc:postgresql://<<DB_HOST>>:5432/app_test" \
+                              --username=ci \
+                              --password="$LB_PASSWORD" \
+                              --search-path=. \
+                              --changelog-file=sql/db.changelog-master.xml \
+                              update
+
+                            # Liquibase tags are rollback targets, which is why
+                            # Flyway has no equivalent field. Stamping the
+                            # execution ID gives `liquibase rollback` a point to
+                            # return to. Separate command: update takes no
+                            # --tag.
+                            liquibase \
+                              --url="jdbc:postgresql://<<DB_HOST>>:5432/app_test" \
+                              --username=ci \
+                              --password="$LB_PASSWORD" \
+                              --search-path=. \
+                              --changelog-file=sql/db.changelog-master.xml \
+                              tag "<+pipeline.executionId>"
+                        timeout: 15m
+
+                    # ---- 5. Verify. This is the gate. ----
+                    # Tool-agnostic on purpose: it asserts about the database,
+                    # not about migration metadata, so it is the same six checks
+                    # whichever apply step ran.
+                    - step:
+                        type: Run
+                        name: Verify Migration
+                        identifier: verify_migration
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          image: postgres:16.4
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            PGHOST: <<DB_HOST>>
+                            PGUSER: ci
+                            PGDATABASE: app_test
+                            PGPASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                          command: |
+                            set -e
+                            cd <<REPO_NAME>>
+                            psql -v ON_ERROR_STOP=1 -f sql/checks/verify.sql
+                            echo "Migration earned its merge."
+                        timeout: 10m
+
+    ###########################################################################
+    # STAGE 3 — Destroy it. Unconditionally.
+    #
+    # `when.pipelineStatus: All` is doing real work here: without it, a failed
+    # migration leaves the database running and you have reinvented the
+    # shared staging database you were trying to escape.
+    #
+    # This stage is only honest if it shares state with stage 1. A destroy that
+    # cannot see the previous apply's state plans nothing, prints "no changes",
+    # and goes green while the database keeps running — a leak that looks like
+    # a success. That is what backend-kubernetes.tf.example is for, and why
+    # both stages copy it into place before init.
+    ###########################################################################
+    - stage:
+        name: Destroy Ephemeral DB
+        identifier: destroy_ephemeral_db
+        type: Custom
+        when:
+          pipelineStatus: All
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Destroy
+                  identifier: destroy
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <<K8S_CONNECTOR>>
+                      namespace: <<HARNESS_BUILD_NAMESPACE>>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase_destroy
+                        spec:
+                          connectorRef: <<GIT_CONNECTOR>>
+                          repoName: <<REPO_NAME>>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+input>
+                        timeout: 5m
+
+                    - step:
+                        type: Run
+                        name: Terraform Destroy
+                        identifier: terraform_destroy
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          image: hashicorp/terraform:1.5.7
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            TF_IN_AUTOMATION: "true"
+                            # Required even to destroy: the variable has no
+                            # default, and Terraform validates variables before
+                            # it will plan a destroy.
+                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
+                            TF_VAR_namespace: <<DB_NAMESPACE>>
+                            TF_VAR_build_namespace: <<HARNESS_BUILD_NAMESPACE>>
+                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
+                          command: |
+                            set -e
+                            if [ -n "${CUSTOM_CA_PEM_B64:-}" ]; then
+                              echo "$CUSTOM_CA_PEM_B64" | base64 -d \
+                                >> /etc/ssl/certs/ca-certificates.crt
+                            fi
+                            cd <<REPO_NAME>>/terraform
+                            cp backend-kubernetes.tf.example backend-kubernetes.tf
+                            terraform init -input=false
+                            terraform destroy -input=false -auto-approve
+                            echo "Ephemeral database destroyed."
+                        timeout: 15m

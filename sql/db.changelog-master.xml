@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Liquibase entry point.
+
+  This repo runs the same migrations under either tool. Nothing here restates
+  the SQL: both changesets point <sqlFile> at the exact files Flyway reads from
+  sql/migrations/. That is deliberate and load-bearing — the demo rests on one
+  specific ALTER TABLE, and a second copy of it would drift from the first, so
+  the broken-migration exercise would eventually pass under one tool and fail
+  under the other for reasons that have nothing to do with the database.
+
+  Copy sql/broken/V2__add_order_status_BROKEN.sql over
+  sql/migrations/V2__add_order_status.sql and this changelog fails too, with
+  the same Postgres error. No edit here required.
+
+  Paths are relativeToChangelogFile, which is why this file sits at sql/ and
+  not in a subdirectory: "migrations/V1__baseline.sql" resolves the same way
+  regardless of the working directory the runner picks, and it needs no ".."
+  traversal to get there. Move this file and the paths break.
+-->
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+  <!--
+    V1 — the baseline.
+
+    This is the Liquibase answer to Flyway's baselineOnMigrate, and it is a
+    better one: it is declarative, it lives with the migrations, and it does
+    not need a version number kept in sync by hand.
+
+    The pipeline applies V1 with psql before this step runs, so Liquibase
+    arrives at a populated schema with no DATABASECHANGELOG table. Without the
+    precondition it would try to create tables that already exist and fail on
+    "relation already exists". MARK_RAN records the changeset as applied
+    without executing it, and the run proceeds to V2 — the migration actually
+    under review.
+
+    The same changelog still works against a genuinely empty database: the
+    precondition passes and V1 runs for real. Flyway's baselineOnMigrate
+    cannot do both, which is why the Flyway step needs the schema to be
+    pre-populated and this one does not.
+  -->
+  <changeSet id="1-baseline" author="ephemeral-db-harness">
+    <preConditions onFail="MARK_RAN"
+                   onFailMessage="orders already exists, so the psql baseline step got here first. Marking V1 as ran and moving to V2.">
+      <not>
+        <tableExists tableName="orders"/>
+      </not>
+    </preConditions>
+
+    <sqlFile path="migrations/V1__baseline.sql"
+             relativeToChangelogFile="true"
+             splitStatements="true"
+             endDelimiter=";"/>
+
+    <rollback>
+      <sql>DROP INDEX IF EXISTS idx_orders_customer_id;</sql>
+      <sql>DROP TABLE IF EXISTS orders;</sql>
+      <sql>DROP TABLE IF EXISTS customers;</sql>
+    </rollback>
+  </changeSet>
+
+  <!--
+    V2 — the migration under test. This is the one the pipeline exists to
+    judge, and the one that must fail against seeded rows if it is written
+    badly.
+
+    The rollback is written out rather than left to Liquibase's inference:
+    <sqlFile> is opaque to it, so an omitted rollback block means "no rollback
+    available" and `liquibase rollback` refuses. DROP CONSTRAINT has no
+    generic changelog tag in OSS Liquibase, hence raw <sql> for all three.
+  -->
+  <changeSet id="2-add-order-status" author="ephemeral-db-harness">
+    <sqlFile path="migrations/V2__add_order_status.sql"
+             relativeToChangelogFile="true"
+             splitStatements="true"
+             endDelimiter=";"/>
+
+    <rollback>
+      <sql>DROP INDEX IF EXISTS idx_orders_status;</sql>
+      <sql>ALTER TABLE orders DROP CONSTRAINT IF EXISTS chk_orders_status;</sql>
+      <sql>ALTER TABLE orders DROP COLUMN IF EXISTS status;</sql>
+    </rollback>
+  </changeSet>
+
+</databaseChangeLog>

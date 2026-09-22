@@ -1,0 +1,169 @@
+###############################################################################
+# The IaCM version of stages 1 and 3, preserved verbatim.
+#
+# These are a drop-in replacement for the two Custom Terraform stages in
+# pipeline-ephemeral-db-ci.yaml. Paste them over those stages if your cluster's
+# API server is reachable from wherever the IaCM runtime executes. What you gain
+# is worth having: the Resources tab, drift detection, cost estimation, and a
+# plan artifact you can gate with OPA or an approval.
+#
+# What stops them here, and probably wherever your cluster is private:
+# `runtime.type` accepts exactly two values, Cloud and Docker.
+#
+#   Cloud   runs on Harness-hosted infrastructure, outside your network. It
+#           cannot reach a private API server, so the apply cannot connect.
+#   Docker  runs as a container on the delegate host. A Kubernetes delegate is
+#           itself a pod with no Docker daemon to talk to, so there is nothing
+#           to run the container. On a Docker delegate it works, but it is a
+#           container on a host rather than a pod, so it gets no ServiceAccount
+#           token and `kube_config_path` stops being optional — set it as a
+#           workspace variable and mount a kubeconfig the delegate can read.
+#
+# So: use these with a Docker delegate that can reach the cluster, or with a
+# cluster whose endpoint is public. Otherwise use the Custom stages, which run
+# Terraform in a build pod inside the cluster and authenticate as that pod.
+#
+# See ISSUES.md, issue 6.
+#
+# Both stages need <<IACM_WORKSPACE_ID>> and <<DELEGATE_SELECTOR>>, which the
+# Custom stages do not use.
+###############################################################################
+
+    ###########################################################################
+    # STAGE 1 — Provision a database that did not exist 60 seconds ago.
+    #
+    # init -> plan -> apply. The workspace's Terraform creates a namespace,
+    # a Postgres pod, and a Service at a CONSTANT DNS name. The pod is new
+    # every run; the address is not. That distinction is what makes the
+    # fixed DB DevOps connector work.
+    #
+    # ON runtime.type: this must not be Cloud. Harness Cloud runners execute
+    # outside your network and cannot reach a private cluster's API server, so
+    # a Cloud runner can never apply this Terraform. The runtime enum offers
+    # exactly two values — Cloud and Docker — so Docker on an in-cluster
+    # delegate is the only option that can reach the target cluster.
+    #
+    # Docker runtime is a container on the delegate host, NOT a pod with a
+    # ServiceAccount token mounted, so it does not inherit in-cluster
+    # credentials the way the provider's default path expects. Set
+    # kube_config_path as a workspace variable and mount a kubeconfig for the
+    # delegate. variables.tf documents that field; with IaCM it is the normal
+    # path, not the exception.
+    #
+    # This stage is the one part of the pipeline not proven end to end — see
+    # ISSUES.md, issue 6. It needs a delegate with a usable Docker daemon.
+    ###########################################################################
+    - stage:
+        name: Provision Ephemeral DB
+        identifier: provision_ephemeral_db
+        type: IACM
+        spec:
+          workspace: <<IACM_WORKSPACE_ID>>
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Docker
+            spec: {}
+          delegateSelectors:
+            - <<DELEGATE_SELECTOR>>
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: init
+                  identifier: init
+                  timeout: 5m
+                  spec:
+                    command: init
+
+              - step:
+                  type: IACMTerraformPlugin
+                  name: plan
+                  identifier: plan
+                  timeout: 10m
+                  spec:
+                    command: plan
+
+              # Optional but recommended for a talk demo: an OPA policy step
+              # or Approval step slots in right here, between plan and apply.
+              # Cost estimation also renders on the plan output.
+
+              - step:
+                  type: IACMTerraformPlugin
+                  name: apply
+                  identifier: apply
+                  timeout: 15m
+                  spec:
+                    command: apply
+                  # Back-to-back runs race the previous run's teardown: deleting
+                  # a namespace is asynchronous, so this apply can arrive while
+                  # the old one is still Terminating and fail with "object is
+                  # being deleted". Retrying is the whole fix — the namespace
+                  # finishes terminating within seconds.
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Retry
+                          spec:
+                            retryCount: 3
+                            retryIntervals:
+                              - 30s
+                              - 60s
+                              - 120s
+                            onRetryFailure:
+                              action:
+                                type: MarkAsFailure
+
+    ###########################################################################
+    # STAGE 3 — Destroy it. Unconditionally.
+    #
+    # `when.pipelineStatus: All` is doing real work here: without it, a failed
+    # migration leaves the database running and you have reinvented the
+    # shared staging database you were trying to escape.
+    #
+    # Same runtime constraint as stage 1 — see the comment there.
+    ###########################################################################
+    - stage:
+        name: Destroy Ephemeral DB
+        identifier: destroy_ephemeral_db
+        type: IACM
+        when:
+          pipelineStatus: All
+        spec:
+          workspace: <<IACM_WORKSPACE_ID>>
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Docker
+            spec: {}
+          delegateSelectors:
+            - <<DELEGATE_SELECTOR>>
+          execution:
+            steps:
+              - step:
+                  type: IACMTerraformPlugin
+                  name: init
+                  identifier: destroy_init
+                  timeout: 5m
+                  spec:
+                    command: init
+
+              - step:
+                  type: IACMTerraformPlugin
+                  name: plan-destroy
+                  identifier: plan_destroy
+                  timeout: 10m
+                  spec:
+                    command: plan-destroy
+
+              - step:
+                  type: IACMTerraformPlugin
+                  name: destroy
+                  identifier: destroy
+                  timeout: 10m
+                  spec:
+                    command: destroy

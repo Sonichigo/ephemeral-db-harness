@@ -1,0 +1,37 @@
+###############################################################################
+# Remote state in a Kubernetes Secret.
+#
+# Drop the .example suffix to use it. The provision stage of
+# pipeline-ephemeral-db-ci.yaml does that copy itself, which is why this ships
+# as .example: with the file in place Terraform always wants this backend, and
+# a local `terraform apply` against a kubeconfig would then need cluster
+# credentials just to read state.
+#
+# WHY a backend is needed at all: the destroy stage has to know what the
+# provision stage created. Without shared state, `terraform destroy` in a fresh
+# build pod plans against nothing, reports "no changes", exits green, and
+# leaves the database running — the exact leak stage 3 exists to prevent, made
+# invisible by a successful-looking run.
+#
+# WHY the kubernetes backend rather than S3/GCS/Azure: the repo's claim is that
+# it needs no cloud credentials. An object-store backend would put that back.
+# The cluster is already a dependency, and it can hold a Secret.
+#
+# The namespace here must NOT be the namespace this Terraform manages. State
+# stored in dbops-ci would be deleted by the destroy that reads it.
+###############################################################################
+
+terraform {
+  backend "kubernetes" {
+    # Produces a Secret named tfstate-default-ephemeral-db.
+    secret_suffix = "ephemeral-db"
+
+    # The build namespace: long-lived, created outside this Terraform, and
+    # already where the build pods run.
+    namespace = "harness-builds"
+
+    # Use the build pod's mounted ServiceAccount token. No kubeconfig, no
+    # cloud credentials.
+    in_cluster_config = true
+  }
+}

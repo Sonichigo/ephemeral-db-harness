@@ -1,0 +1,118 @@
+###############################################################################
+# OPTIONAL: let IaCM own the JDBC connector.
+#
+# Named .tf.example so Terraform ignores it. Drop the .example suffix to use it,
+# and skip the manual connector step in SETUP.md.
+#
+# WHY THIS EXISTS
+#
+# DB Instances require a fixed connector: the connector reference cannot be a
+# pipeline expression, because drift detection and other features resolve the
+# schema, instance, and connector outside of pipeline execution.
+#
+# There are two ways to satisfy that, not one:
+#
+#   1. Keep the ADDRESS constant. What the rest of this module does. The
+#      Service DNS name never changes, so a hand-created connector pinned to it
+#      stays valid forever. Simplest option, and it needs no Harness
+#      credentials in the workspace.
+#
+#   2. Keep the connector IDENTIFIER constant and let Terraform manage its URL.
+#      What this file does. The DB Instance references "ephemeral_db_jdbc"
+#      forever, while the url attribute is rewritten on every apply.
+#
+# Option 2 is the better general answer, and the only workable one when the
+# hostname is generated for you rather than chosen by you: a managed database
+# such as Cloud SQL, RDS, or MongoDB Atlas hands back a new endpoint on every
+# create, so there is no constant address to pin a connector to.
+#
+# For the in-cluster Postgres in this module, option 1 is enough and cheaper to
+# set up, which is why it is the default here. Do not read that as a limitation
+# of the platform.
+#
+# COST OF THIS OPTION
+#
+# The workspace gains a provider that needs Harness credentials, and the
+# connector becomes a Terraform-managed resource, so `destroy` deletes it. If
+# the destroy stage removes the connector on every run, the DB Instance points
+# at a connector that does not exist between runs. Either keep the connector in
+# a separate long-lived workspace from the disposable database, or accept that
+# the DB Instance is only resolvable while a run is in flight.
+###############################################################################
+
+# Add to the required_providers block in main.tf:
+#
+#   harness = {
+#     source  = "harness/harness"
+#     version = "~> 0.30"
+#   }
+
+provider "harness" {
+  # Reads HARNESS_ACCOUNT_ID, HARNESS_PLATFORM_API_KEY, and HARNESS_ENDPOINT
+  # from the environment. Supply the API key as a secret workspace variable
+  # rather than inline.
+  endpoint         = var.harness_endpoint
+  account_id       = var.harness_account_id
+  platform_api_key = var.harness_platform_api_key
+}
+
+resource "harness_platform_connector_jdbc" "ephemeral_db" {
+  # The identifier is the contract with the DB Instance. It must not change.
+  identifier = "ephemeral_db_jdbc"
+  name       = "Ephemeral DB JDBC"
+  org_id     = var.harness_org_id
+  project_id = var.harness_project_id
+
+  # The URL, by contrast, is free to change on every apply. Here it happens to
+  # be stable because the Service name is stable, but this is the line that
+  # would carry a generated endpoint for a managed database.
+  url = "jdbc:postgresql://${kubernetes_service.postgres.metadata[0].name}.${kubernetes_namespace.ephemeral.metadata[0].name}.svc.cluster.local:5432/${var.db_name}"
+
+  delegate_selectors = var.delegate_selectors
+
+  credentials {
+    username     = var.db_user
+    password_ref = var.db_password_secret_ref
+  }
+}
+
+# Variables this file needs, in addition to the ones in variables.tf.
+
+variable "harness_endpoint" {
+  type    = string
+  default = "https://app.harness.io/gateway"
+}
+
+variable "harness_account_id" {
+  type = string
+}
+
+variable "harness_platform_api_key" {
+  description = "Supply as a SECRET workspace variable."
+  type        = string
+  sensitive   = true
+}
+
+variable "harness_org_id" {
+  type = string
+}
+
+variable "harness_project_id" {
+  type = string
+}
+
+variable "delegate_selectors" {
+  description = "Tags of the in-cluster delegate that can reach the database."
+  type        = list(string)
+}
+
+variable "db_password_secret_ref" {
+  description = <<-DESC
+    Reference to the existing Harness secret holding the database password, for
+    example "account.ephemeral_db_password". This is the same secret passed to
+    the module as db_password, referenced rather than recreated so the connector
+    and the database cannot disagree about the credential.
+  DESC
+  type    = string
+  default = "account.ephemeral_db_password"
+}

@@ -1,0 +1,123 @@
+###############################################################################
+# One-time cluster bootstrap. Apply as a cluster admin before the first run:
+#
+#   kubectl apply -f terraform/bootstrap/provisioner-rbac.yaml
+#
+# This is the "you bring the cluster and the permissions" prerequisite made
+# explicit. It grants the pipeline's build ServiceAccount exactly the access
+# the Terraform in this directory needs, and nothing else.
+#
+# Everything else in this repo is applied BY the pipeline. This file cannot be,
+# because it is what gives the pipeline permission to apply anything — so it
+# has to come from outside. It is also why it is plain YAML rather than more
+# Terraform: nothing should be able to widen its own grants.
+#
+# Edit the two namespaces if yours differ. build_namespace in variables.tf and
+# <<HARNESS_BUILD_NAMESPACE>> in the pipeline must match the subject namespace
+# below.
+###############################################################################
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: harness-builds
+---
+###############################################################################
+# Cluster-scoped, because creating and deleting a namespace is cluster-scoped.
+# The resource list matches what terraform/ actually manages — compare against
+# main.tf, reaper.tf and build-access.tf. Adding a resource there means adding
+# it here, and the failure if you forget is a clear Forbidden on apply.
+###############################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ephemeral-db-provisioner
+rules:
+  # main.tf: the namespace itself.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+
+  # main.tf: the credentials Secret and the stable Service.
+  # reaper.tf: the reaper's ServiceAccount.
+  - apiGroups: [""]
+    resources: ["secrets", "services", "serviceaccounts"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+
+  # main.tf: the Postgres Deployment. The provider reads rollout status, so it
+  # needs list and watch as well as get — the same trap build-access.tf hit.
+  #
+  # deployments/scale is here for a second reason. Nothing in this repo scales a
+  # Deployment as this ServiceAccount; reaper.tf and build-access.tf GRANT that
+  # verb to other subjects, and Kubernetes refuses to let a principal grant a
+  # permission it does not itself hold. Omit it and the apply creates the
+  # namespace, Secret, Service, Deployment and CronJob, then fails only on the
+  # four Roles and RoleBindings — a half-provisioned namespace whose database
+  # comes up fine and whose reaper can never scale it down.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+
+  # reaper.tf: the CronJob.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+
+  # reaper.tf and build-access.tf: the scoped Roles and RoleBindings.
+  #
+  # Kubernetes forbids granting permissions you do not hold, so a principal
+  # creating these must either hold every verb they contain or have "escalate".
+  # This ClusterRole holds them all above, which is why "escalate" is absent —
+  # if a Role here ever grants something outside this list, that is a real
+  # signal and not something to paper over with escalate.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete", "bind"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ephemeral-db-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: harness-builds
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ephemeral-db-provisioner
+---
+###############################################################################
+# State access, scoped to the build namespace only — see
+# backend-kubernetes.tf.example.
+#
+# The kubernetes backend keeps state in a Secret and takes its lock with a
+# Lease in coordination.k8s.io. Omit the Lease rule and `terraform init`
+# succeeds while `apply` fails on the lock, which reads as a state corruption
+# problem rather than a missing permission.
+###############################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ephemeral-db-tfstate
+  namespace: harness-builds
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ephemeral-db-tfstate
+  namespace: harness-builds
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: harness-builds
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ephemeral-db-tfstate
