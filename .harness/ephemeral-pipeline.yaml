@@ -1,0 +1,560 @@
+pipeline:
+  name: Ephemeral DB Full E2E
+  identifier: ephemeral_db_e2e_onboarding
+  projectIdentifier: ephemeral_db_ci
+  orgIdentifier: default
+  tags: {}
+  variables:
+    - name: K8S_CONNECTOR
+      type: String
+      description: Kubernetes connector ID used to run the build pods.
+      required: true
+      value: <+input>.default(k8s_minikube)
+    - name: GIT_CONNECTOR
+      type: String
+      description: Git connector ID for the repo that holds terraform/ and sql/.
+      required: true
+      value: <+input>.default(harness_code_git)
+    - name: DOCKER_CONNECTOR
+      type: String
+      description: Docker registry connector ID. Use an authenticated one if you hit Docker Hub rate limits.
+      required: true
+      value: <+input>.default(dockerhub_anon)
+    - name: REPO_NAME
+      type: String
+      description: Repo that contains terraform/ and (optionally) sql/.
+      required: true
+      value: <+input>.default(ephemeral-db-harness)
+    - name: BRANCH
+      type: String
+      description: Branch to clone in every stage. Use your PR branch to test a change.
+      required: true
+      value: <+input>.default(main)
+    - name: DB_SCHEMA
+      type: String
+      description: The identifier of your existing DB Schema entity. Use the identifier shown on the entity page (underscores), not the display name. Needed for Flyway, and for Liquibase when LIQUIBASE_RUNNER is DBSchemaApply.
+      required: false
+      value: <+input>
+    - name: DB_INSTANCE
+      type: String
+      description: The identifier of your existing DB Instance entity. Its connection string must match the ephemeral DB host (see header). Needed for Flyway, and for Liquibase when LIQUIBASE_RUNNER is DBSchemaApply.
+      required: false
+      value: <+input>
+    - name: MIGRATION_TOOL
+      type: String
+      description: Flyway or Liquibase.
+      required: true
+      value: <+input>.default(Flyway).allowedValues(Flyway,Liquibase)
+    - name: LIQUIBASE_RUNNER
+      type: String
+      description: Liquibase only. DBSchemaApply uses your DB Schema and DB Instance entities and shows up under Migration State in the Database DevOps UI. CLI runs the changelog from the repo and is invisible to that UI. Use CLI only if DBSchemaApply fails for Liquibase.
+      required: true
+      value: <+input>.default(DBSchemaApply).allowedValues(DBSchemaApply,CLI)
+    - name: BUILD_NAMESPACE
+      type: String
+      description: Namespace where the build pods run.
+      required: true
+      value: <+input>.default(harness-builds)
+    - name: DB_NAMESPACE
+      type: String
+      description: Namespace Terraform creates for the ephemeral database.
+      required: true
+      value: <+input>.default(dbops-ci)
+    - name: RESET_DB
+      type: String
+      description: Drop and recreate the public schema before loading the baseline. Makes re-runs safe if an earlier destroy leaked the database.
+      required: true
+      value: <+input>.default(true).allowedValues(true,false)
+    - name: BASELINE_SQL
+      type: String
+      description: Path in the repo to a baseline SQL file loaded before migrations. Leave empty to skip.
+      required: false
+      value: <+input>.default(sql/migrations/V1__baseline.sql)
+    - name: SEED_SQL
+      type: String
+      description: Path in the repo to seed data SQL. Leave empty to skip.
+      required: false
+      value: <+input>.default(sql/seed/seed.sql)
+    - name: VERIFY_SQL
+      type: String
+      description: Path in the repo to a verification SQL file run after migrating. Leave empty to skip.
+      required: false
+      value: <+input>.default(sql/checks/verify.sql)
+    - name: LIQUIBASE_CHANGELOG
+      type: String
+      description: Liquibase CLI runner only. Changelog path relative to the repo root. The DBSchemaApply runner reads the path stored on the DB Schema entity instead.
+      required: false
+      value: <+input>.default(sql/db.changelog-master.xml)
+    - name: CUSTOM_CA_PEM_B64
+      type: String
+      description: Optional. Base64 of a PEM CA bundle to trust, for TLS-inspecting proxies. Leave empty if you do not need it.
+      required: false
+      value: <+input>
+  stages:
+    - stage:
+        name: Provision Ephemeral DB
+        identifier: provision_ephemeral_db
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: Queue
+                  name: Serialize Runs
+                  identifier: serialize_runs
+                  spec:
+                    key: ephemeral-db-<+pipeline.variables.DB_NAMESPACE>
+                    scope: Pipeline
+              - stepGroup:
+                  name: Provision
+                  identifier: provision
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <+pipeline.variables.K8S_CONNECTOR>
+                      namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase_provision
+                        spec:
+                          connectorRef: <+pipeline.variables.GIT_CONNECTOR>
+                          repoName: <+pipeline.variables.REPO_NAME>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+pipeline.variables.BRANCH>
+                        timeout: 5m
+                    - step:
+                        type: Run
+                        name: Preflight Checks
+                        identifier: preflight_checks
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: hashicorp/terraform:1.5.7
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            REPO_NAME: <+pipeline.variables.REPO_NAME>
+                            MIGRATION_TOOL: <+pipeline.variables.MIGRATION_TOOL>
+                            LIQUIBASE_RUNNER: <+pipeline.variables.LIQUIBASE_RUNNER>
+                            BASELINE_SQL: <+pipeline.variables.BASELINE_SQL>
+                            SEED_SQL: <+pipeline.variables.SEED_SQL>
+                            VERIFY_SQL: <+pipeline.variables.VERIFY_SQL>
+                            LIQUIBASE_CHANGELOG: <+pipeline.variables.LIQUIBASE_CHANGELOG>
+                            DB_SCHEMA: <+pipeline.variables.DB_SCHEMA>
+                            DB_INSTANCE: <+pipeline.variables.DB_INSTANCE>
+                            DB_PASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                          command: |
+                            set -eu
+                            fail() { echo "PREFLIGHT FAILED: $1" >&2; exit 1; }
+
+                            [ -n "${DB_PASSWORD:-}" ] || fail "secret ephemeral_db_password resolved to an empty value."
+                            [ -d "$REPO_NAME" ] || fail "repo folder $REPO_NAME was not cloned. Check GIT_CONNECTOR, REPO_NAME and BRANCH."
+
+                            cd "$REPO_NAME"
+                            [ -d terraform ] || fail "terraform/ folder not found in the repo."
+                            [ -f terraform/backend-kubernetes.tf.example ] || fail "terraform/backend-kubernetes.tf.example not found. It is needed so destroy can find the state."
+
+                            check_file() {
+                              if [ -n "$2" ] && [ ! -f "$2" ]; then
+                                fail "$1 is set to '$2' but that file does not exist in the repo. Fix the path or leave it empty to skip."
+                              fi
+                            }
+                            check_file BASELINE_SQL "${BASELINE_SQL:-}"
+                            check_file SEED_SQL "${SEED_SQL:-}"
+                            check_file VERIFY_SQL "${VERIFY_SQL:-}"
+
+                            if [ "$MIGRATION_TOOL" = "Liquibase" ] && [ "$LIQUIBASE_RUNNER" = "CLI" ]; then
+                              [ -n "${LIQUIBASE_CHANGELOG:-}" ] || fail "LIQUIBASE_RUNNER is CLI but LIQUIBASE_CHANGELOG is empty."
+                              [ -f "$LIQUIBASE_CHANGELOG" ] || fail "Liquibase changelog '$LIQUIBASE_CHANGELOG' not found in the repo."
+                            fi
+
+                            USES_ENTITIES=false
+                            [ "$MIGRATION_TOOL" = "Flyway" ] && USES_ENTITIES=true
+                            [ "$MIGRATION_TOOL" = "Liquibase" ] && [ "$LIQUIBASE_RUNNER" = "DBSchemaApply" ] && USES_ENTITIES=true
+                            if [ "$USES_ENTITIES" = "true" ]; then
+                              [ -n "${DB_SCHEMA:-}" ] || fail "This run uses DBSchemaApply but DB_SCHEMA is empty. Enter your DB Schema identifier."
+                              [ -n "${DB_INSTANCE:-}" ] || fail "This run uses DBSchemaApply but DB_INSTANCE is empty. Enter your DB Instance identifier."
+                            fi
+
+                            for v in "${DB_SCHEMA:-}" "${DB_INSTANCE:-}"; do
+                              case "$v" in
+                                *-*) echo "WARNING: '$v' contains a hyphen. Harness identifiers normally use underscores. If you copied the display name, use the identifier shown on the entity page." ;;
+                              esac
+                            done
+
+                            echo "Preflight passed."
+                        timeout: 5m
+                    - step:
+                        type: Run
+                        name: Terraform Apply
+                        identifier: terraform_apply
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: hashicorp/terraform:1.5.7
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            TF_IN_AUTOMATION: "true"
+                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
+                            TF_VAR_namespace: <+pipeline.variables.DB_NAMESPACE>
+                            TF_VAR_build_namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                            REPO_NAME: <+pipeline.variables.REPO_NAME>
+                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
+                          command: |
+                            set -e
+
+                            case "${CUSTOM_CA_PEM_B64:-}" in
+                              ""|null) ;;
+                              *)
+                                echo "$CUSTOM_CA_PEM_B64" | base64 -d >> /etc/ssl/certs/ca-certificates.crt \
+                                  || { echo "CUSTOM_CA_PEM_B64 is not valid base64." >&2; exit 1; }
+                                echo "Added a custom CA to the trust store."
+                                ;;
+                            esac
+
+                            cd "$REPO_NAME/terraform"
+
+                            # Remote state lives in a Secret so the destroy stage
+                            # can find what this stage created. Without it,
+                            # destroy plans against empty state, exits green,
+                            # and leaks the database.
+                            cp backend-kubernetes.tf.example backend-kubernetes.tf
+
+                            terraform init -input=false
+                            terraform apply -input=false -auto-approve
+
+                            echo "--- outputs ---"
+                            terraform output
+                        timeout: 15m
+                        failureStrategies:
+                          - onFailure:
+                              errors:
+                                - AllErrors
+                              action:
+                                type: Retry
+                                spec:
+                                  retryCount: 3
+                                  retryIntervals:
+                                    - 30s
+                                    - 60s
+                                    - 120s
+                                  onRetryFailure:
+                                    action:
+                                      type: MarkAsFailure
+    - stage:
+        name: Migrate and Verify
+        identifier: migrate_and_verify
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Ephemeral DB Checks
+                  identifier: ephemeral_db_checks
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <+pipeline.variables.K8S_CONNECTOR>
+                      namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase_migrate
+                        spec:
+                          connectorRef: <+pipeline.variables.GIT_CONNECTOR>
+                          repoName: <+pipeline.variables.REPO_NAME>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+pipeline.variables.BRANCH>
+                        timeout: 5m
+                    - step:
+                        type: Run
+                        name: Wake And Wait For DB
+                        identifier: wake_and_wait
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: alpine/k8s:1.30.0
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            NS: <+pipeline.variables.DB_NAMESPACE>
+                          command: |
+                            set -eu
+
+                            REPLICAS=$(kubectl get deploy ephemeral-db -n "$NS" \
+                              -o jsonpath='{.spec.replicas}')
+                            if [ "$REPLICAS" = "0" ]; then
+                              echo "Reaper had scaled this to zero. Waking it."
+                              kubectl scale deploy ephemeral-db -n "$NS" --replicas=1
+                            fi
+
+                            # Heartbeat so a reaper, if you run one, does not
+                            # scale the database away during a long pipeline.
+                            kubectl annotate deploy ephemeral-db -n "$NS" \
+                              "harness.io/last-used=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                              --overwrite
+
+                            kubectl rollout status deploy/ephemeral-db -n "$NS" --timeout=180s
+                            echo "Database is up."
+                        timeout: 10m
+                    - step:
+                        type: Run
+                        name: Wait For DB Ready
+                        identifier: wait_for_db
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: postgres:16.4
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            PGHOST: ephemeral-db.<+pipeline.variables.DB_NAMESPACE>.svc.cluster.local
+                            PGUSER: ci
+                            PGDATABASE: app_test
+                            PGPASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                          command: |
+                            set -e
+                            for i in $(seq 1 40); do
+                              if pg_isready -q; then
+                                echo "Database is accepting connections."
+                                exit 0
+                              fi
+                              sleep 3
+                            done
+                            echo "Database never became ready at $PGHOST." >&2
+                            exit 1
+                        timeout: 5m
+                    - step:
+                        type: Run
+                        name: Load Baseline And Seed Data
+                        identifier: load_seed
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: postgres:16.4
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            PGHOST: ephemeral-db.<+pipeline.variables.DB_NAMESPACE>.svc.cluster.local
+                            PGUSER: ci
+                            PGDATABASE: app_test
+                            PGPASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                            REPO_NAME: <+pipeline.variables.REPO_NAME>
+                            RESET_DB: <+pipeline.variables.RESET_DB>
+                            BASELINE_SQL: <+pipeline.variables.BASELINE_SQL>
+                            SEED_SQL: <+pipeline.variables.SEED_SQL>
+                          command: |
+                            set -e
+                            cd "$REPO_NAME"
+
+                            if [ "$RESET_DB" = "true" ]; then
+                              echo "RESET_DB is true. Recreating the public schema."
+                              psql -v ON_ERROR_STOP=1 -q \
+                                -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
+                            fi
+
+                            run_if_set() {
+                              if [ -n "$2" ]; then
+                                psql -v ON_ERROR_STOP=1 -q -f "$2"
+                                echo "Loaded $1: $2"
+                              else
+                                echo "Skipping $1 (not set)."
+                              fi
+                            }
+                            run_if_set baseline "${BASELINE_SQL:-}"
+                            run_if_set seed "${SEED_SQL:-}"
+
+                            echo "Tables now in the database:"
+                            psql -c "\dt"
+                        timeout: 10m
+              - stepGroup:
+                  name: Apply Schema Flyway
+                  identifier: apply_flyway
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.variables.MIGRATION_TOOL> == "Flyway"
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <+pipeline.variables.K8S_CONNECTOR>
+                      namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                  steps:
+                    - step:
+                        type: DBSchemaApply
+                        name: Apply Schema Flyway
+                        identifier: apply_schema_flyway
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          migrationType: Flyway
+                          globalSettings:
+                            baselineOnMigrate: "true"
+                          dbSchema: <+pipeline.variables.DB_SCHEMA>
+                          dbInstance: <+pipeline.variables.DB_INSTANCE>
+                        timeout: 15m
+              - stepGroup:
+                  name: Apply Schema Liquibase
+                  identifier: apply_liquibase_native
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.variables.MIGRATION_TOOL> == "Liquibase" && <+pipeline.variables.LIQUIBASE_RUNNER> == "DBSchemaApply"
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <+pipeline.variables.K8S_CONNECTOR>
+                      namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                  steps:
+                    - step:
+                        type: DBSchemaApply
+                        name: Apply Schema Liquibase
+                        identifier: apply_schema_liquibase_native
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          migrationType: Liquibase
+                          dbSchema: <+pipeline.variables.DB_SCHEMA>
+                          dbInstance: <+pipeline.variables.DB_INSTANCE>
+                        timeout: 15m
+              - stepGroup:
+                  name: Verify
+                  identifier: verify
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <+pipeline.variables.K8S_CONNECTOR>
+                      namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase_verify
+                        spec:
+                          connectorRef: <+pipeline.variables.GIT_CONNECTOR>
+                          repoName: <+pipeline.variables.REPO_NAME>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+pipeline.variables.BRANCH>
+                        timeout: 5m
+                    - step:
+                        type: Run
+                        name: Refresh Heartbeat
+                        identifier: refresh_heartbeat
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: alpine/k8s:1.30.0
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            NS: <+pipeline.variables.DB_NAMESPACE>
+                          command: |
+                            kubectl annotate deploy ephemeral-db -n "$NS" \
+                              "harness.io/last-used=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                              --overwrite \
+                              || echo "Heartbeat skipped."
+                        timeout: 5m
+                    - step:
+                        type: Run
+                        name: Verify Migration
+                        identifier: verify_migration
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: postgres:16.4
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            PGHOST: ephemeral-db.<+pipeline.variables.DB_NAMESPACE>.svc.cluster.local
+                            PGUSER: ci
+                            PGDATABASE: app_test
+                            PGPASSWORD: <+secrets.getValue("ephemeral_db_password")>
+                            REPO_NAME: <+pipeline.variables.REPO_NAME>
+                            VERIFY_SQL: <+pipeline.variables.VERIFY_SQL>
+                          command: |
+                            set -e
+                            cd "$REPO_NAME"
+                            if [ -n "${VERIFY_SQL:-}" ]; then
+                              psql -v ON_ERROR_STOP=1 -f "$VERIFY_SQL"
+                              echo "Migration earned its merge."
+                            else
+                              echo "VERIFY_SQL is empty, so nothing was checked. Add a verify script to make this run meaningful."
+                            fi
+                        timeout: 10m
+    - stage:
+        name: Destroy Ephemeral DB
+        identifier: destroy_ephemeral_db
+        type: Custom
+        when:
+          pipelineStatus: All
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Destroy
+                  identifier: destroy
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <+pipeline.variables.K8S_CONNECTOR>
+                      namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase_destroy
+                        spec:
+                          connectorRef: <+pipeline.variables.GIT_CONNECTOR>
+                          repoName: <+pipeline.variables.REPO_NAME>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+pipeline.variables.BRANCH>
+                        timeout: 5m
+                    - step:
+                        type: Run
+                        name: Terraform Destroy
+                        identifier: terraform_destroy
+                        spec:
+                          connectorRef: <+pipeline.variables.DOCKER_CONNECTOR>
+                          image: hashicorp/terraform:1.5.7
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            TF_IN_AUTOMATION: "true"
+                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
+                            TF_VAR_namespace: <+pipeline.variables.DB_NAMESPACE>
+                            TF_VAR_build_namespace: <+pipeline.variables.BUILD_NAMESPACE>
+                            REPO_NAME: <+pipeline.variables.REPO_NAME>
+                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
+                          command: |
+                            set -e
+
+                            case "${CUSTOM_CA_PEM_B64:-}" in
+                              ""|null) ;;
+                              *)
+                                echo "$CUSTOM_CA_PEM_B64" | base64 -d >> /etc/ssl/certs/ca-certificates.crt \
+                                  || { echo "CUSTOM_CA_PEM_B64 is not valid base64." >&2; exit 1; }
+                                ;;
+                            esac
+
+                            cd "$REPO_NAME/terraform"
+                            cp backend-kubernetes.tf.example backend-kubernetes.tf
+                            terraform init -input=false
+                            terraform destroy -input=false -auto-approve
+                            echo "Ephemeral database destroyed."
+                        timeout: 15m
+                        failureStrategies:
+                          - onFailure:
+                              errors:
+                                - AllErrors
+                              action:
+                                type: Retry
+                                spec:
+                                  retryCount: 3
+                                  retryIntervals:
+                                    - 30s
+                                    - 60s
+                                    - 120s
+                                  onRetryFailure:
+                                    action:
+                                      type: MarkAsFailure
