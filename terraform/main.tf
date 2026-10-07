@@ -28,11 +28,76 @@ terraform {
   }
 }
 
+###############################################################################
+# Three ways to authenticate. They are listed in the order this repo PREFERS
+# them, which is the reverse of the order the provider RESOLVES them — see the
+# warning at the bottom, where an accidentally-discovered kubeconfig beats the
+# explicit token. Only the first is used by the configuration this repo ships.
+#
+#   1. IN-CLUSTER CREDENTIALS — the primary path. Leave kube_config_path and
+#      kube_config_context empty and set nothing else. The provider reads the
+#      projected ServiceAccount token at
+#      /var/run/secrets/kubernetes.io/serviceaccount/ and the in-cluster API
+#      address from KUBERNETES_SERVICE_HOST.
+#
+#      This is also the path the IaCM stages take, which is not obvious.
+#      Kubernetes build infrastructure is selected through the stage's
+#      'infrastructure' block, not through 'runtime' — 'infrastructure: type:
+#      KubernetesDirect' runs the IaCM Terraform plugin in a build POD in the
+#      target cluster with a mounted ServiceAccount token, which is exactly the
+#      identity this block expects. Nothing here needs to change for IaCM, and
+#      no KUBE_* variables are needed.
+#
+#      Proven: terraform 1.5.7 in a pod in harness-builds as ServiceAccount
+#      'default', no kubeconfig, this file unchanged — two full applies and two
+#      full destroys, 40 resource operations, zero Forbidden errors.
+#
+#   2. KUBE_HOST + KUBE_CLUSTER_CA_CERT_DATA + KUBE_TOKEN, with
+#      kube_config_path still empty. This is for the Docker and Cloud IaCM
+#      runtimes, which run the plugin outside the cluster: there is no pod, so
+#      there is no mounted token, so the credentials have to arrive as
+#      environment variables. The encodings are not guessable:
+#
+#        KUBE_HOST                   full URI including the scheme, e.g.
+#                                    https://1.2.3.4:6443
+#        KUBE_CLUSTER_CA_CERT_DATA   RAW PEM, including the
+#                                    -----BEGIN CERTIFICATE----- lines. NOT
+#                                    base64, despite the _DATA suffix.
+#        KUBE_TOKEN                  the raw JWT
+#
+#      Base64-encode the CA and the failure reads like a corrupt certificate
+#      rather than a wrong encoding:
+#
+#        Error: Failed to configure client: unable to load root certificates:
+#        unable to parse bytes as PEM block
+#
+#   3. kube_config_path (and optionally kube_config_context) for a local apply
+#      against a kubeconfig. Convenient for development; not what either IaCM
+#      path uses.
+#
+# WARNING, and this one is load-bearing. Setting kube_config_path to "" makes
+# config_path null below, and a null config_path ACTIVATES the provider's own
+# environment-variable default: it then reads KUBE_CONFIG_PATH and
+# KUBE_CONFIG_PATHS. A kubeconfig discovered that way SILENTLY WINS over
+# KUBE_TOKEN. Proven with KUBE_CONFIG_PATH set alongside a deliberately invalid
+# KUBE_TOKEN: the run printed
+#
+#   No changes. Your infrastructure matches the configuration.
+#
+# against the wrong cluster, with no warning anywhere.
+#
+# This hazard is PATH-INDEPENDENT. Paths 1 and 2 both leave kube_config_path
+# empty, so both activate that default — path 1, the primary one, included. On
+# path 1 a stray KUBE_CONFIG_PATH beats the pod's own projected ServiceAccount
+# token exactly as it beats KUBE_TOKEN on path 2. So KUBE_CONFIG_PATH and
+# KUBE_CONFIG_PATHS must be unset on both. Only path 3, which sets
+# kube_config_path to a non-empty value, is immune — there config_path is
+# explicit and no default applies.
+#
+# Note the provider does NOT read KUBECONFIG, so unsetting only KUBECONFIG —
+# the obvious move — protects nothing.
+###############################################################################
 provider "kubernetes" {
-  # Leave both unset to use in-cluster credentials — the normal case when the
-  # IaCM stage runs on a delegate inside the target cluster. Set
-  # kube_config_path for a delegate outside the cluster, or when running
-  # locally against a kubeconfig.
   config_path    = var.kube_config_path != "" ? var.kube_config_path : null
   config_context = var.kube_config_context != "" ? var.kube_config_context : null
 }

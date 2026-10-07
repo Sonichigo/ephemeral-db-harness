@@ -131,15 +131,43 @@ variable "build_service_account" {
 
 variable "kube_config_path" {
   description = <<-DESC
-    Leave empty to use in-cluster credentials — the normal case when the
-    IaCM stage runs on a delegate inside the target cluster. Set this when
-    the delegate is outside the cluster or when running locally.
+    OPTIONAL, and unused on both IaCM paths. Set it only for a local apply
+    against a kubeconfig.
+
+    On the primary IaCM path the stage's infrastructure is KubernetesDirect, so
+    the Terraform plugin runs in a build pod with a mounted ServiceAccount
+    token and the provider picks those credentials up by itself. On the
+    Docker/Cloud IaCM runtimes there is no pod and no token, so credentials
+    arrive instead as KUBE_HOST, KUBE_CLUSTER_CA_CERT_DATA (raw PEM, not
+    base64) and KUBE_TOKEN. Neither case wants this variable set.
+
+    "Leave empty to use in-cluster credentials" is the obvious description and
+    it is factually incomplete. Empty makes the provider's config_path null,
+    and a null config_path ACTIVATES the provider's environment-variable
+    default: it reads KUBE_CONFIG_PATH and KUBE_CONFIG_PATHS. A kubeconfig
+    found that way silently takes precedence over KUBE_TOKEN — the run reports
+    "No changes. Your infrastructure matches the configuration." against
+    whatever cluster that kubeconfig points at, with no warning. Unset both of
+    those variables wherever KUBE_TOKEN is in use. The provider does not read
+    KUBECONFIG, so unsetting only KUBECONFIG protects nothing.
   DESC
   type        = string
   default     = ""
 }
 
 variable "kube_config_context" {
-  type    = string
-  default = ""
+  description = <<-DESC
+    OPTIONAL, and like kube_config_path unused on both IaCM paths. Only
+    meaningful alongside a kubeconfig — a context name in a multi-cluster
+    kubeconfig during a local apply.
+
+    Empty leaves the provider's config_context null, which means the
+    kubeconfig's current-context. Harmless when no kubeconfig is in play at
+    all, which is the case for in-cluster credentials and for the
+    KUBE_HOST/KUBE_CLUSTER_CA_CERT_DATA/KUBE_TOKEN environment-variable path.
+    See kube_config_path for the precedence trap that makes a stray kubeconfig
+    matter more than it looks.
+  DESC
+  type        = string
+  default     = ""
 }

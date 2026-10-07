@@ -1,11 +1,45 @@
 ###############################################################################
-# Remote state in a Kubernetes Secret.
+# Remote state in a Kubernetes Secret — FOR THE CUSTOM-STAGE FALLBACK ONLY.
 #
-# Drop the .example suffix to use it. The provision stage of
-# pipeline-ephemeral-db-ci.yaml does that copy itself, which is why this ships
-# as .example: with the file in place Terraform always wants this backend, and
-# a local `terraform apply` against a kubeconfig would then need cluster
-# credentials just to read state.
+# Stages 1 and 3 of pipeline-ephemeral-db-ci.yaml are IaCM stages, and IaCM
+# manages state itself, in the workspace. This file is for the Custom-stage
+# variant in harness/custom-stages.yaml.example, which runs Terraform directly
+# and therefore has to bring its own backend.
+#
+# DO NOT rename this to .tf on the IaCM path. If a backend block is present in
+# the terraform/ directory the workspace points at, it diverts state away from
+# the platform — which reintroduces precisely the silent-green-leak described
+# below, the failure this file was added to prevent. The IaCM stages have no
+# step that copies this file into place, deliberately; the Custom-stage
+# fallback does that copy itself, which is why this ships as .example.
+#
+# The other reason it ships as .example: with the file in place Terraform
+# always wants this backend, so a local `terraform apply` against a kubeconfig
+# would need cluster credentials just to read state.
+#
+# ---------------------------------------------------------------------------
+# WARNING: secret_suffix is a fixed literal, so all consumers share one state.
+#
+# secret_suffix below is hardcoded to "ephemeral-db", so every consumer of this
+# repo on one cluster writes to the SAME state object:
+# secret/tfstate-default-ephemeral-db in harness-builds. Two pipelines, two
+# DB_NAMESPACE values, or two branches pointed at the same cluster overwrite
+# each other's state, and then the loser's destroy plans against the winner's
+# resources — destroying infrastructure it never created, or reporting nothing
+# to do about infrastructure it did.
+#
+# The backend's Lease only serializes CONCURRENT access. It does not separate
+# unrelated states; two pipelines take turns corrupting each other politely.
+#
+# secret_suffix cannot be a variable — backend blocks accept no interpolation —
+# so the fix is to pass it at init time instead:
+#
+#   terraform init -backend-config=secret_suffix=<something-per-workspace>
+#
+# Use something that varies with whatever varies: the namespace, the pipeline
+# identifier, the branch. This affects the Custom-stage fallback only, since
+# IaCM owns state on the primary path.
+# ---------------------------------------------------------------------------
 #
 # WHY a backend is needed at all: the destroy stage has to know what the
 # provision stage created. Without shared state, `terraform destroy` in a fresh

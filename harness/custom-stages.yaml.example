@@ -1,0 +1,298 @@
+###############################################################################
+# The Custom-stage variant of stages 1 and 3 — the fallback, and the path that
+# has actually been run.
+#
+# These two stages are a drop-in replacement for the IACM stages 1 and 3 in
+# pipeline-ephemeral-db-ci.yaml. They run Terraform yourself, in a build pod in
+# the target cluster, authenticating as that pod's ServiceAccount. Stage 2 is
+# the same either way and is not reproduced here.
+#
+# WHY THIS FILE EXISTS, stated plainly: this is the version proven end to end
+# on a real Harness account against a real cluster — all three stages green,
+# from an empty cluster to a destroyed namespace, on both migration tools
+# (Flyway: provision 102s, destroy 81s; Liquibase: 94s and 52s — see
+# ISSUES.md). The IACM stages now in the pipeline are schema-validated against
+# Harness's published pipeline schema and reasoned from the docs, but they have
+# never been executed on an account: no workspace was created and the Resources
+# tab was never seen. If you need a green run today, start here.
+#
+# WHEN TO USE IT:
+#   - Your account or your module licensing does not include IaCM.
+#   - You want the path with a run history behind it rather than the one with a
+#     schema check behind it.
+#   - Your cluster cannot host Harness build pods at all, so you have to run on
+#     Docker or Cloud runtime with env-var credentials. In that case see
+#     terraform/bootstrap/provisioner-rbac.yaml, which carries an optional
+#     named ServiceAccount and a long-lived token Secret for exactly that
+#     case — the default harness-builds:default binding is an in-cluster POD
+#     identity and gives you no token to paste anywhere.
+#
+# WHAT YOU GIVE UP by using it: the Resources tab, drift detection, cost
+# estimation, the plan artifact you can gate with OPA or an approval, and
+# platform-managed state. The last one is not a nicety — see the backend note
+# below.
+#
+# THE TWO PATHS ARE MUTUALLY EXCLUSIVE. These stages copy
+# backend-kubernetes.tf.example into place, which puts a `backend "kubernetes"`
+# block in terraform/. If an IaCM workspace ever points at a terraform/
+# directory containing that block, Terraform honours the block and state goes
+# to the Secret instead of to the platform — so IaCM's own state stays empty,
+# its destroy plans against nothing, and you are back to the silent leak. Use
+# one path or the other, not a mixture.
+#
+# ALSO REQUIRED IF YOU USE THESE STAGES
+#
+# 1. Re-add the CUSTOM_CA_PEM_B64 pipeline variable. It was removed from the
+#    main pipeline when stages 1 and 3 became IACM stages, because the two
+#    Terraform Run steps below were its only consumers. The steps below still
+#    reference <+pipeline.variables.CUSTOM_CA_PEM_B64>, so without the variable
+#    the pipeline will not save. Paste this back into pipeline.variables,
+#    alongside MIGRATION_TOOL:
+#
+#     # Leave empty unless your egress goes through a TLS-inspecting proxy — the
+#     # kind of corporate MITM appliance that presents its own certificate for
+#     # every HTTPS host it re-signs. Your laptop and your delegate host
+#     # trust the proxy's root CA because someone installed it there; a build
+#     # container starts from the image's CA bundle and does not, so
+#     # `terraform init` dies reaching registry.terraform.io with:
+#     #
+#     #   Failed to query available provider packages
+#     #   ... tls: failed to verify certificate: x509: certificate signed by
+#     #   unknown authority
+#     #
+#     # which reads like a Terraform or registry problem and is neither. Image
+#     # pulls and git clone keep working, because the kubelet and the Harness
+#     # steps use hosts and images that already trust the proxy — so only the
+#     # Terraform steps fail, which points suspicion in the wrong direction.
+#     #
+#     # Base64, not raw PEM: a multi-line value would have to survive expression
+#     # substitution into a shell script intact. Set it to a secret expression,
+#     # e.g. <+secrets.getValue("custom_ca_pem_b64")>, holding the output of
+#     #   base64 < your-root-ca.pem | tr -d '\n'
+#     - name: CUSTOM_CA_PEM_B64
+#       type: String
+#       description: "Optional. Base64 of a PEM CA bundle to trust, for TLS-inspecting proxies. Empty means no-op."
+#       required: false
+#       value: ""
+#
+#    The IaCM-native equivalent is the workspace environment variable
+#    PLUGIN_CA_CERT_PATH, which is NOT a drop-in swap — it takes a filesystem
+#    path to an already-mounted PEM bundle, not base64 of one. See ISSUES.md,
+#    issue 14.
+#
+# 2. Keep terraform/backend-kubernetes.tf.example. It is what makes stage 3
+#    honest: a destroy that cannot see stage 1's state plans nothing, prints
+#    "No changes. No objects need to be destroyed.", exits 0, and leaves the
+#    database running. That failure mode has been reproduced deliberately; it
+#    is a green run that leaks.
+#
+#    Its secret_suffix is hardcoded to "ephemeral-db", so the state object is
+#    always secret/tfstate-default-ephemeral-db in the build namespace. Every
+#    consumer of this repo pointed at one cluster therefore shares ONE state
+#    object. Two pipelines, two DB_NAMESPACE values, or two branches against
+#    the same cluster will overwrite each other's state, and the loser's
+#    destroy will plan against the winner's resources. The Lease only
+#    serializes concurrent access; it does not separate unrelated states.
+#    secret_suffix cannot be a variable inside a backend block, so the fix is
+#    at init time:
+#
+#      terraform init -input=false \
+#        -backend-config=secret_suffix=ephemeral-db-<something-unique>
+#
+#    Use the same value in both stages, or stage 3 destroys nothing. This whole
+#    problem is specific to this file: on the IaCM path the platform owns state
+#    per workspace and there is no shared Secret to collide over.
+#
+# 3. Everything the main pipeline already needs: the <<K8S_CONNECTOR>>,
+#    <<GIT_CONNECTOR>> and <<DOCKER_CONNECTOR>> placeholders, and
+#    terraform/bootstrap/provisioner-rbac.yaml applied once by a cluster admin.
+#    These stages do NOT need <<IACM_WORKSPACE_ID>>; delete that variable from
+#    the pipeline if neither remaining stage uses it.
+###############################################################################
+
+    ###########################################################################
+    # STAGE 1 — Provision a database that did not exist 60 seconds ago.
+    #
+    # This runs Terraform in a build pod inside the target cluster, using the
+    # pod's own ServiceAccount token — the same identity, in the same place, as
+    # the IACM KubernetesDirect stage it replaces. The difference is who owns
+    # the state and who renders the plan, not who authenticates.
+    #
+    # Note what is NOT the reason to be here. IaCM is not blocked on a private
+    # cluster: Kubernetes build infrastructure is selected through
+    # `infrastructure: KubernetesDirect`, not through `runtime`, whose enum is
+    # the two-value [Docker, Cloud] that made this look impossible. See
+    # ISSUES.md, issue 6, for the wrong turn and the correction.
+    #
+    # Prerequisite: terraform/bootstrap/provisioner-rbac.yaml, applied once by
+    # a cluster admin. It grants this build pod's ServiceAccount the access
+    # the Terraform needs. Without it the apply fails Forbidden on the first
+    # namespace it tries to create.
+    ###########################################################################
+    - stage:
+        name: Provision Ephemeral DB
+        identifier: provision_ephemeral_db
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Provision
+                  identifier: provision
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <<K8S_CONNECTOR>>
+                      namespace: <<HARNESS_BUILD_NAMESPACE>>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase
+                        spec:
+                          connectorRef: <<GIT_CONNECTOR>>
+                          repoName: <<REPO_NAME>>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+input>
+                        timeout: 5m
+
+                    - step:
+                        type: Run
+                        name: Terraform Apply
+                        identifier: terraform_apply
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          # 1.5.7 is the last MPL-licensed release. 1.6.0+ is
+                          # BSL and not supported here; OpenTofu works too.
+                          image: hashicorp/terraform:1.5.7
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            TF_IN_AUTOMATION: "true"
+                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
+                            TF_VAR_namespace: <<DB_NAMESPACE>>
+                            TF_VAR_build_namespace: <<HARNESS_BUILD_NAMESPACE>>
+                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
+                          command: |
+                            set -e
+
+                            # No-op unless CUSTOM_CA_PEM_B64 is set — see the
+                            # pipeline variable for why this exists.
+                            if [ -n "${CUSTOM_CA_PEM_B64:-}" ]; then
+                              echo "$CUSTOM_CA_PEM_B64" | base64 -d \
+                                >> /etc/ssl/certs/ca-certificates.crt
+                              echo "Added a custom CA to the trust store."
+                            fi
+
+                            cd <<REPO_NAME>>/terraform
+
+                            # Remote state in a Secret, so stage 3 can destroy
+                            # what this stage created. Without it, destroy plans
+                            # against empty state, reports no changes, exits
+                            # green, and leaks the database.
+                            cp backend-kubernetes.tf.example backend-kubernetes.tf
+
+                            terraform init -input=false
+                            terraform apply -input=false -auto-approve
+
+                            echo "--- outputs ---"
+                            terraform output
+                        timeout: 15m
+                        # Back-to-back runs race the previous run's teardown:
+                        # deleting a namespace is asynchronous, so this apply
+                        # can arrive while the old one is still Terminating and
+                        # fail with "object is being deleted". Retrying is the
+                        # whole fix — the namespace finishes terminating within
+                        # seconds.
+                        failureStrategies:
+                          - onFailure:
+                              errors:
+                                - AllErrors
+                              action:
+                                type: Retry
+                                spec:
+                                  retryCount: 3
+                                  retryIntervals:
+                                    - 30s
+                                    - 60s
+                                    - 120s
+                                  onRetryFailure:
+                                    action:
+                                      type: MarkAsFailure
+
+    ###########################################################################
+    # STAGE 3 — Destroy it. Unconditionally.
+    #
+    # `when.pipelineStatus: All` is doing real work here: without it, a failed
+    # migration leaves the database running and you have reinvented the
+    # shared staging database you were trying to escape.
+    #
+    # This stage is only honest if it shares state with stage 1. A destroy that
+    # cannot see the previous apply's state plans nothing, prints "no changes",
+    # and goes green while the database keeps running — a leak that looks like
+    # a success. That is what backend-kubernetes.tf.example is for, and why
+    # both stages copy it into place before init.
+    ###########################################################################
+    - stage:
+        name: Destroy Ephemeral DB
+        identifier: destroy_ephemeral_db
+        type: Custom
+        when:
+          pipelineStatus: All
+        spec:
+          execution:
+            steps:
+              - stepGroup:
+                  name: Destroy
+                  identifier: destroy
+                  stepGroupInfra:
+                    type: KubernetesDirect
+                    spec:
+                      connectorRef: <<K8S_CONNECTOR>>
+                      namespace: <<HARNESS_BUILD_NAMESPACE>>
+                  steps:
+                    - step:
+                        type: GitClone
+                        name: Clone Codebase
+                        identifier: clone_codebase_destroy
+                        spec:
+                          connectorRef: <<GIT_CONNECTOR>>
+                          repoName: <<REPO_NAME>>
+                          build:
+                            type: branch
+                            spec:
+                              branch: <+input>
+                        timeout: 5m
+
+                    - step:
+                        type: Run
+                        name: Terraform Destroy
+                        identifier: terraform_destroy
+                        spec:
+                          connectorRef: <<DOCKER_CONNECTOR>>
+                          image: hashicorp/terraform:1.5.7
+                          shell: Sh
+                          imagePullPolicy: IfNotPresent
+                          envVariables:
+                            TF_IN_AUTOMATION: "true"
+                            # Required even to destroy: the variable has no
+                            # default, and Terraform validates variables before
+                            # it will plan a destroy.
+                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
+                            TF_VAR_namespace: <<DB_NAMESPACE>>
+                            TF_VAR_build_namespace: <<HARNESS_BUILD_NAMESPACE>>
+                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
+                          command: |
+                            set -e
+                            if [ -n "${CUSTOM_CA_PEM_B64:-}" ]; then
+                              echo "$CUSTOM_CA_PEM_B64" | base64 -d \
+                                >> /etc/ssl/certs/ca-certificates.crt
+                            fi
+                            cd <<REPO_NAME>>/terraform
+                            cp backend-kubernetes.tf.example backend-kubernetes.tf
+                            terraform init -input=false
+                            terraform destroy -input=false -auto-approve
+                            echo "Ephemeral database destroyed."
+                        timeout: 15m

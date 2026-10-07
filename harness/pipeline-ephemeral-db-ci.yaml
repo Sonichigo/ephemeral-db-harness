@@ -5,10 +5,34 @@ pipeline:
   orgIdentifier: <<ORG_ID>>
   tags: {}
 
-  # No properties.ci.codebase block here, deliberately. It only takes effect for
-  # CI (Build) stages, and this pipeline has none — stage 2 is a Custom stage.
-  # Setting it would look like the repository was available on disk when it was
-  # not. The GitClone step in stage 2 does that job explicitly.
+  # Required, not cosmetic. Without it, selective stage execution is rejected
+  # outright — `POST /pipeline/api/pipeline/execute/{id}/stages` returns
+  # HTTP 400 "Stage executions are not allowed for pipeline [...]", and the UI
+  # offers no stage picker. The headline acceptance check for this repo is
+  # "run stage 1 alone, then stage 3 alone, confirm the namespace is gone",
+  # which is exactly a selective stage execution. Observed: the 400 above, on
+  # a pipeline identical to this one but missing this key.
+  allowStageExecutions: true
+
+  # No properties.ci.codebase block here, deliberately. A codebase block takes
+  # effect for stages that clone a codebase, and no stage here does: stage 2 is
+  # a Custom stage, and stages 1 and 3 are IACM stages that set
+  # `cloneCodebase: false`. Setting it would look like the repository was
+  # available on disk when it was not. The GitClone step in stage 2 does that
+  # job explicitly — and because it does, that step's branch is a runtime
+  # input: every run has to supply it.
+  #
+  # Observed consequence of forgetting it: a run that fills in MIGRATION_TOOL
+  # but leaves the branch empty fails stage 2 with
+  # "[Environment variable DRONE_COMMIT_BRANCH can't be empty or null]" —
+  # which names a Drone variable nothing in this pipeline mentions, two levels
+  # of abstraction away from the field actually left blank. Stages 1 and 3 run
+  # fine, so the failure looks like a migration problem rather than a missing
+  # input. The stage-2 GitClone step below is the only runtime input besides
+  # MIGRATION_TOOL; see SETUP.md step 7.
+  #
+  # Stages 1 and 3 do not need a checkout: the IaCM workspace points at this
+  # repository and the plugin fetches the Terraform itself.
 
   variables:
     # Flyway or Liquibase. The migrations themselves are shared: Liquibase runs
@@ -23,153 +47,189 @@ pipeline:
       required: true
       value: <+input>.default(Flyway).allowedValues(Flyway,Liquibase)
 
-    # Leave empty unless your egress goes through a TLS-inspecting proxy — the
-    # kind of corporate MITM appliance that presents its own certificate for
-    # every HTTPS host it re-signs. Your laptop and your delegate host
-    # trust the proxy's root CA because someone installed it there; a build
-    # container starts from the image's CA bundle and does not, so
-    # `terraform init` dies reaching registry.terraform.io with:
+    # There is deliberately no CUSTOM_CA_PEM_B64 variable here any more. Its
+    # only consumers were the two Terraform Run steps in the old Custom stages
+    # 1 and 3; now that those stages are IACM stages, nothing in this pipeline
+    # reads it, and a pipeline variable nobody reads is a trap for the next
+    # person. The variable and the shell block that decoded it moved, verbatim,
+    # into harness/custom-stages.yaml.example — if you switch to that fallback,
+    # paste the variable back, because those steps still reference it.
     #
-    #   Failed to query available provider packages
-    #   ... tls: failed to verify certificate: x509: certificate signed by
-    #   unknown authority
-    #
-    # which reads like a Terraform or registry problem and is neither. Image
-    # pulls and git clone keep working, because the kubelet and the Harness
-    # steps use hosts and images that already trust the proxy — so only the
-    # Terraform steps fail, which points suspicion in the wrong direction.
-    #
-    # Base64, not raw PEM: a multi-line value would have to survive expression
-    # substitution into a shell script intact. Set it to a secret expression,
-    # e.g. <+secrets.getValue("custom_ca_pem_b64")>, holding the output of
-    #   base64 < your-root-ca.pem | tr -d '\n'
-    - name: CUSTOM_CA_PEM_B64
-      type: String
-      description: "Optional. Base64 of a PEM CA bundle to trust, for TLS-inspecting proxies. Empty means no-op."
-      required: false
-      value: ""
+    # The IaCM-native route for a TLS-inspecting proxy is the workspace
+    # environment variable PLUGIN_CA_CERT_PATH. It is NOT a drop-in swap for
+    # base64-in-a-variable: it takes a filesystem PATH to "a single PEM file
+    # containing one or more certificates (a CA bundle), not a directory", and
+    # that file has to be mounted into the build container already — on
+    # Kubernetes build infrastructure, through the `volumes` or `podSpecOverlay`
+    # fields of the infrastructure spec below. Its DOCUMENTED scope is the
+    # provisioner binary download; the failure actually observed here was
+    # PROVIDER download from registry.terraform.io during init. The docs say the
+    # plugin also exports SSL_CERT_FILE, CURL_CA_BUNDLE and SSL_CERT_DIR, which
+    # would plausibly cover providers too — but that is inference from the
+    # exported variables, not a documented guarantee, and it has not been
+    # tested. See ISSUES.md, issue 14.
 
   stages:
     ###########################################################################
     # STAGE 1 — Provision a database that did not exist 60 seconds ago.
     #
-    # This runs Terraform in a build pod inside the target cluster, using the
-    # pod's own ServiceAccount token. It is NOT an IaCM stage, and that is a
-    # deliberate correction rather than a simplification.
+    # init -> plan -> apply, run by IaCM against the workspace's Terraform. The
+    # workspace creates a namespace, a Postgres pod, and a Service at a
+    # CONSTANT DNS name. The pod is new every run; the address is not. That
+    # distinction is what makes the fixed DB DevOps connector in stage 2 work.
     #
-    # IaCM cannot do this job against a private cluster. Its runtime enum
-    # accepts exactly two values, Cloud and Docker. Cloud runners execute on
-    # Harness-hosted infrastructure outside your network and cannot reach an
-    # in-cluster API server. Docker runs on the delegate host, which needs a
-    # usable Docker daemon that a Kubernetes delegate does not have, and even
-    # then it is a container on the host rather than a pod, so it inherits no
-    # in-cluster identity. Neither reaches the cluster the way the provider in
-    # main.tf expects. See ISSUES.md, issue 6.
+    # STATUS, because it matters more than the explanation below: these two
+    # IACM stages are SCHEMA-VALIDATED ONLY. They were checked against
+    # Harness's published pipeline JSON schema, and the Kubernetes build
+    # infrastructure claim is corroborated by the IaCM delegate docs and by
+    # running this exact Terraform as a pod with this exact identity on a real
+    # cluster. They have NEVER been executed on app.harness.io — no IaCM
+    # workspace was created and the Resources tab has never been seen here.
+    # Schema-valid is not "will run": the schema sets additionalProperties
+    # nowhere on this path, so misplaced keys validate and are then ignored at
+    # runtime. If you want the path with a green run behind it, stages 1 and 3
+    # in harness/custom-stages.yaml.example are a drop-in replacement and are
+    # proven end to end.
     #
-    # If your cluster's API server IS reachable from Harness Cloud, the
-    # original IaCM stages are preserved verbatim in
-    # harness/iacm-stages.yaml.example and are a drop-in replacement for this
-    # stage and stage 3. You gain the Resources tab, drift detection and cost
-    # estimation; you need a reachable endpoint and credentials in the
-    # workspace to get them.
+    # ON infrastructure, and why this is NOT `runtime`: an IACM stage takes
+    # EITHER a CI-style `infrastructure` block or a `runtime` block. `runtime`
+    # has exactly two values, Docker and Cloud, and neither can reach a private
+    # API server as a pod — which is why this repo once concluded IaCM could
+    # not do the job at all. The conclusion was wrong: Kubernetes build
+    # infrastructure is not selected through `runtime`. `infrastructure:
+    # KubernetesDirect` runs the plugin in a build POD in the target cluster
+    # with a ServiceAccount token mounted, which is exactly what main.tf's
+    # provider expects when kube_config_path is empty. See ISSUES.md, issue 6.
+    #
+    # No `platform:` block. Under KubernetesDirect the OS belongs to the
+    # infrastructure spec (`os: Linux`), and there is no arch to choose — the
+    # node pool decides. `platform` is schema-optional alongside
+    # `infrastructure`, but do NOT nest it inside infrastructure.spec: all five
+    # infrastructure variants share one type enum and two of them require
+    # `platform`, so nesting it makes the block match several variants at once
+    # and the pipeline is rejected with a confusing "is valid under each of ...
+    # HostedVmInfraYaml, K8sDirectInfraYaml ...".
+    #
+    # No `serviceAccountName`. Omitted means the build pod uses the namespace's
+    # `default` ServiceAccount, and `default` is precisely what
+    # terraform/bootstrap/provisioner-rbac.yaml binds the provisioner
+    # ClusterRole to. Naming any other SA here silently un-grants that RBAC and
+    # the apply fails Forbidden on the first namespace it creates. There is no
+    # placeholder for it on purpose.
+    #
+    # No `delegateSelectors` either. It is a STAGE-level field, not a spec
+    # field, and it is not needed: the Kubernetes connector named below already
+    # routes through a delegate. (Putting it under spec: validates and is then
+    # ignored, which is the worst of both.)
+    #
+    # automountServiceAccountToken: true is the load-bearing line. It is also
+    # the platform default, and it is set explicitly to document the
+    # dependency: without the token in the pod the provider has no in-cluster
+    # credentials and kube_config_path stops being optional.
+    #
+    # cloneCodebase: false is deliberate — see the header comment on
+    # properties.ci.codebase.
     #
     # Prerequisite: terraform/bootstrap/provisioner-rbac.yaml, applied once by
-    # a cluster admin. It grants this build pod's ServiceAccount the access
-    # the Terraform needs. Without it the apply fails Forbidden on the first
-    # namespace it tries to create.
+    # a cluster admin. It grants this build pod's ServiceAccount the access the
+    # Terraform needs. Without it the apply fails Forbidden on the first
+    # namespace it tries to create. The optional named-ServiceAccount section
+    # in that file is for the Docker/Cloud fallback and is NOT needed here.
     ###########################################################################
     - stage:
         name: Provision Ephemeral DB
         identifier: provision_ephemeral_db
-        type: Custom
+        type: IACM
         spec:
+          workspace: <<IACM_WORKSPACE_ID>>
+          cloneCodebase: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: <<K8S_CONNECTOR>>
+              namespace: <<HARNESS_BUILD_NAMESPACE>>
+              automountServiceAccountToken: true
+              os: Linux
           execution:
             steps:
-              - stepGroup:
-                  name: Provision
-                  identifier: provision
-                  stepGroupInfra:
-                    type: KubernetesDirect
-                    spec:
-                      connectorRef: <<K8S_CONNECTOR>>
-                      namespace: <<HARNESS_BUILD_NAMESPACE>>
-                  steps:
-                    - step:
-                        type: GitClone
-                        name: Clone Codebase
-                        identifier: clone_codebase
-                        spec:
-                          connectorRef: <<GIT_CONNECTOR>>
-                          repoName: <<REPO_NAME>>
-                          build:
-                            type: branch
-                            spec:
-                              branch: <+input>
-                        timeout: 5m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: init
+                  identifier: init
+                  timeout: 5m
+                  spec:
+                    # `command` is a bare string in the schema with no enum, so
+                    # every value in this stage is a typo waiting to validate.
+                    # See the longer note on stage 3, where it is dangerous.
+                    command: init
 
-                    - step:
-                        type: Run
-                        name: Terraform Apply
-                        identifier: terraform_apply
-                        spec:
-                          connectorRef: <<DOCKER_CONNECTOR>>
-                          # 1.5.7 is the last MPL-licensed release. 1.6.0+ is
-                          # BSL and not supported here; OpenTofu works too.
-                          image: hashicorp/terraform:1.5.7
-                          shell: Sh
-                          imagePullPolicy: IfNotPresent
-                          envVariables:
-                            TF_IN_AUTOMATION: "true"
-                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
-                            TF_VAR_namespace: <<DB_NAMESPACE>>
-                            TF_VAR_build_namespace: <<HARNESS_BUILD_NAMESPACE>>
-                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
-                          command: |
-                            set -e
+              - step:
+                  type: IACMTerraformPlugin
+                  name: plan
+                  identifier: plan
+                  timeout: 10m
+                  spec:
+                    command: plan
 
-                            # No-op unless CUSTOM_CA_PEM_B64 is set — see the
-                            # pipeline variable for why this exists.
-                            if [ -n "${CUSTOM_CA_PEM_B64:-}" ]; then
-                              echo "$CUSTOM_CA_PEM_B64" | base64 -d \
-                                >> /etc/ssl/certs/ca-certificates.crt
-                              echo "Added a custom CA to the trust store."
-                            fi
+              # The plan -> apply seam is where a gate would go. Neither of the
+              # two options is enabled here, and both have a cost worth knowing
+              # before you turn it on.
+              #
+              # An IACMApproval step would hold the pipeline here. The docs are
+              # explicit that "the underlying machine running the pipeline
+              # remains active until the approval is resolved. This means it
+              # will continue consuming compute resources", and that "the
+              # approval plan step has a timeout of up to 60 minutes ... Upon
+              # timeout, the pipeline fails." That is not just a bill: it widens
+              # exactly the window described in ISSUES.md issue 10, where a run
+              # cancelled between the apply and stage 2's wake step leaks a
+              # database permanently. A human sitting on an approval for forty
+              # minutes with the database already created is that window.
+              #
+              # An OPA gate belongs here too, but NOT as a step-level policy
+              # attachment, because that configuration FAILS OPEN. It has to be
+              # a policy set with entity type "Terraform Plan" and evaluation
+              # event "After Terraform Plan", which fires automatically — the
+              # docs say "You do not attach them in the plan or apply step's
+              # policy configuration UI ... It will not appear there. This is
+              # expected behavior." Attach some other entity type to the plan
+              # step and "the plan step does not pass the Terraform plan JSON as
+              # input to the policy", so "the policy can pass even when the plan
+              # violates the policy rules" — a green gate that checked nothing.
+              # Rego reads input.planned_values and input.resource_changes.
+              # Verify it with the policy set's Evaluations tab, which "shows
+              # the exact input payload passed to the policy"; if the payload is
+              # not a plan, the rule never had a chance to fire.
+              #
+              # Cost estimation renders on the plan without any of this.
 
-                            cd <<REPO_NAME>>/terraform
-
-                            # Remote state in a Secret, so stage 3 can destroy
-                            # what this stage created. Without it, destroy plans
-                            # against empty state, reports no changes, exits
-                            # green, and leaks the database.
-                            cp backend-kubernetes.tf.example backend-kubernetes.tf
-
-                            terraform init -input=false
-                            terraform apply -input=false -auto-approve
-
-                            echo "--- outputs ---"
-                            terraform output
-                        timeout: 15m
-                        # Back-to-back runs race the previous run's teardown:
-                        # deleting a namespace is asynchronous, so this apply
-                        # can arrive while the old one is still Terminating and
-                        # fail with "object is being deleted". Retrying is the
-                        # whole fix — the namespace finishes terminating within
-                        # seconds.
-                        failureStrategies:
-                          - onFailure:
-                              errors:
-                                - AllErrors
+              - step:
+                  type: IACMTerraformPlugin
+                  name: apply
+                  identifier: apply
+                  timeout: 15m
+                  spec:
+                    command: apply
+                  # Back-to-back runs race the previous run's teardown:
+                  # deleting a namespace is asynchronous, so this apply can
+                  # arrive while the old one is still Terminating and fail with
+                  # "object is being deleted". Retrying is the whole fix — the
+                  # namespace finishes terminating within seconds.
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Retry
+                          spec:
+                            retryCount: 3
+                            retryIntervals:
+                              - 30s
+                              - 60s
+                              - 120s
+                            onRetryFailure:
                               action:
-                                type: Retry
-                                spec:
-                                  retryCount: 3
-                                  retryIntervals:
-                                    - 30s
-                                    - 60s
-                                    - 120s
-                                  onRetryFailure:
-                                    action:
-                                      type: MarkAsFailure
+                                type: MarkAsFailure
     ###########################################################################
     # STAGE 2 — Prove the migration against that database.
     #
@@ -224,10 +284,25 @@ pipeline:
                         spec:
                           connectorRef: <<GIT_CONNECTOR>>
                           repoName: <<REPO_NAME>>
+                          # A setup-time placeholder, NOT `<+input>`. This was
+                          # `<+input>` and it does not work: the Custom stage's
+                          # Initialize step builds the container environment
+                          # for every step in the group up front, and a branch
+                          # left to runtime input is still empty at that point.
+                          # The stage dies before GitClone runs, with
+                          # "[Environment variable DRONE_COMMIT_BRANCH can't be
+                          # empty or null]" — a Drone variable nothing in this
+                          # file mentions. Observed three times on
+                          # app.harness.io, including with the branch supplied
+                          # in exactly the shape
+                          # `GET /pipeline/api/inputSets/template` returns, so
+                          # it is not a matter of getting the payload right.
+                          # Stages 1 and 3 pass, so it reads as a migration
+                          # failure rather than a missing input.
                           build:
                             type: branch
                             spec:
-                              branch: <+input>
+                              branch: <<REPO_BRANCH>>
                         timeout: 5m
 
                     # ---- 1. Wake the database and wait for it ----
@@ -400,26 +475,25 @@ pipeline:
                     # genuinely empty database, where the precondition passes and
                     # V1 runs for real.
                     #
-                    # This is a Run step and not DBSchemaApply, which is a
-                    # concession to a platform bug rather than a preference.
-                    # DBSchemaApply with migrationType: Liquibase fails at
-                    # runtime with "Unable to fetch port details": the wrapper
-                    # spawns an "Import ChangeSets" sub-step that the
-                    # Initialize step never allocated a container for, so the
-                    # step cannot start. It reproduces with and without `tag`
-                    # and with a single unconditional step, and DBSchemaApply
-                    # is not in the CI stage's step enum, so a Custom-stage
-                    # step group is the only context available. See ISSUES.md,
-                    # issue 13. Switch this back to DBSchemaApply — the
-                    # commented block in that issue — once Harness fixes it,
-                    # and the Liquibase path regains the migration dashboard
-                    # and governance that the Flyway path already has.
+                    # This is a DBSchemaApply step, structurally identical to
+                    # 4a. The only field that differs is `migrationType`, plus
+                    # the DB Schema and Instance it points at — Liquibase needs
+                    # its own pair because `migrationType` is fixed on the DB
+                    # Schema and cannot be an expression.
                     #
-                    # The DB Schema and Instance are still worth creating: they
-                    # cost nothing, and they are what a fixed DBSchemaApply
-                    # would use.
+                    # No globalSettings here. baselineOnMigrate is a Flyway
+                    # setting and Liquibase has no equivalent; it does not need
+                    # one, because the baseline changeset carries the
+                    # precondition described above.
+                    #
+                    # No `tag` either. Keeping the two steps as close to
+                    # identical as the platform allows is worth more than a
+                    # rollback target the verify step never uses, and `tag` is
+                    # the field the earlier "Unable to fetch port details"
+                    # investigation suspected. If you want rollback points,
+                    # add `tag` here only — Flyway rejects it outright.
                     - step:
-                        type: Run
+                        type: DBSchemaApply
                         name: Apply Schema Liquibase
                         identifier: apply_schema_liquibase
                         when:
@@ -427,39 +501,9 @@ pipeline:
                           condition: <+pipeline.variables.MIGRATION_TOOL> == "Liquibase"
                         spec:
                           connectorRef: <<DOCKER_CONNECTOR>>
-                          image: liquibase/liquibase:4.29
-                          shell: Sh
-                          imagePullPolicy: IfNotPresent
-                          envVariables:
-                            LB_PASSWORD: <+secrets.getValue("ephemeral_db_password")>
-                          command: |
-                            set -e
-                            cd <<REPO_NAME>>
-
-                            # searchPath is the repo root and the changelog is
-                            # named relative to it. Liquibase 4.x refuses an
-                            # absolute changelog path outside the search path,
-                            # so this pairing is not optional.
-                            liquibase \
-                              --url="jdbc:postgresql://<<DB_HOST>>:5432/app_test" \
-                              --username=ci \
-                              --password="$LB_PASSWORD" \
-                              --search-path=. \
-                              --changelog-file=sql/db.changelog-master.xml \
-                              update
-
-                            # Liquibase tags are rollback targets, which is why
-                            # Flyway has no equivalent field. Stamping the
-                            # execution ID gives `liquibase rollback` a point to
-                            # return to. Separate command: update takes no
-                            # --tag.
-                            liquibase \
-                              --url="jdbc:postgresql://<<DB_HOST>>:5432/app_test" \
-                              --username=ci \
-                              --password="$LB_PASSWORD" \
-                              --search-path=. \
-                              --changelog-file=sql/db.changelog-master.xml \
-                              tag "<+pipeline.executionId>"
+                          migrationType: Liquibase
+                          dbSchema: <<DB_SCHEMA_LIQUIBASE>>
+                          dbInstance: <<DB_INSTANCE_LIQUIBASE>>
                         timeout: 15m
 
                     # ---- 5. Verify. This is the gate. ----
@@ -494,70 +538,74 @@ pipeline:
     # migration leaves the database running and you have reinvented the
     # shared staging database you were trying to escape.
     #
-    # This stage is only honest if it shares state with stage 1. A destroy that
-    # cannot see the previous apply's state plans nothing, prints "no changes",
-    # and goes green while the database keeps running — a leak that looks like
-    # a success. That is what backend-kubernetes.tf.example is for, and why
-    # both stages copy it into place before init.
+    # Same infrastructure block as stage 1, and for the same reasons — see the
+    # comments there, including the note that this path is schema-validated and
+    # not yet executed.
+    #
+    # State comes from the IaCM workspace rather than from a Kubernetes Secret
+    # backend, so this destroy sees stage 1's apply without the
+    # `cp backend-kubernetes.tf.example backend-kubernetes.tf` the Custom
+    # stages need. That copy is not just unnecessary here, it is harmful: a
+    # backend block in the workspace's terraform/ directory would divert state
+    # away from the platform, and then this destroy would plan against empty
+    # state, print "No changes. No objects need to be destroyed.", exit 0, and
+    # leave the database running. That failure has been reproduced on purpose;
+    # it is a green run that leaks. Platform-owned state is what removes it.
     ###########################################################################
     - stage:
         name: Destroy Ephemeral DB
         identifier: destroy_ephemeral_db
-        type: Custom
+        type: IACM
         when:
           pipelineStatus: All
         spec:
+          workspace: <<IACM_WORKSPACE_ID>>
+          cloneCodebase: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: <<K8S_CONNECTOR>>
+              namespace: <<HARNESS_BUILD_NAMESPACE>>
+              automountServiceAccountToken: true
+              os: Linux
           execution:
             steps:
-              - stepGroup:
-                  name: Destroy
-                  identifier: destroy
-                  stepGroupInfra:
-                    type: KubernetesDirect
-                    spec:
-                      connectorRef: <<K8S_CONNECTOR>>
-                      namespace: <<HARNESS_BUILD_NAMESPACE>>
-                  steps:
-                    - step:
-                        type: GitClone
-                        name: Clone Codebase
-                        identifier: clone_codebase_destroy
-                        spec:
-                          connectorRef: <<GIT_CONNECTOR>>
-                          repoName: <<REPO_NAME>>
-                          build:
-                            type: branch
-                            spec:
-                              branch: <+input>
-                        timeout: 5m
+              - step:
+                  type: IACMTerraformPlugin
+                  name: init
+                  identifier: destroy_init
+                  timeout: 5m
+                  spec:
+                    command: init
 
-                    - step:
-                        type: Run
-                        name: Terraform Destroy
-                        identifier: terraform_destroy
-                        spec:
-                          connectorRef: <<DOCKER_CONNECTOR>>
-                          image: hashicorp/terraform:1.5.7
-                          shell: Sh
-                          imagePullPolicy: IfNotPresent
-                          envVariables:
-                            TF_IN_AUTOMATION: "true"
-                            # Required even to destroy: the variable has no
-                            # default, and Terraform validates variables before
-                            # it will plan a destroy.
-                            TF_VAR_db_password: <+secrets.getValue("ephemeral_db_password")>
-                            TF_VAR_namespace: <<DB_NAMESPACE>>
-                            TF_VAR_build_namespace: <<HARNESS_BUILD_NAMESPACE>>
-                            CUSTOM_CA_PEM_B64: <+pipeline.variables.CUSTOM_CA_PEM_B64>
-                          command: |
-                            set -e
-                            if [ -n "${CUSTOM_CA_PEM_B64:-}" ]; then
-                              echo "$CUSTOM_CA_PEM_B64" | base64 -d \
-                                >> /etc/ssl/certs/ca-certificates.crt
-                            fi
-                            cd <<REPO_NAME>>/terraform
-                            cp backend-kubernetes.tf.example backend-kubernetes.tf
-                            terraform init -input=false
-                            terraform destroy -input=false -auto-approve
-                            echo "Ephemeral database destroyed."
-                        timeout: 15m
+              # PROOFREAD THE TWO `command` VALUES BELOW BY HAND.
+              #
+              # IACMTerraformPluginInfo.command is a bare {"type": "string"} in
+              # the pipeline schema, with no enum. So `plan-destory`, or
+              # `initialise`, or any other near-miss passes schema validation,
+              # saves cleanly, and fails only when the step actually runs. In
+              # stage 1 that costs you a failed provision. Here it costs more:
+              # this stage runs under `when: pipelineStatus: All`, so the typo
+              # surfaces mid-teardown of real infrastructure, in the one path
+              # whose entire job is to not leak a database. A destroy that
+              # cannot start is indistinguishable, from the outside, from the
+              # leak this stage prevents.
+              #
+              # The documented values are: init, plan, apply, destroy,
+              # plan-destroy, plan-refresh-only, apply-refresh-only,
+              # detect-drift, validate, fmt, import, removed.
+              - step:
+                  type: IACMTerraformPlugin
+                  name: plan-destroy
+                  identifier: plan_destroy
+                  timeout: 10m
+                  spec:
+                    command: plan-destroy
+
+              - step:
+                  type: IACMTerraformPlugin
+                  name: destroy
+                  identifier: destroy
+                  timeout: 10m
+                  spec:
+                    command: destroy

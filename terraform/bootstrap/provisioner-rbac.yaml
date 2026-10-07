@@ -94,6 +94,12 @@ roleRef:
 # Lease in coordination.k8s.io. Omit the Lease rule and `terraform init`
 # succeeds while `apply` fails on the lock, which reads as a state corruption
 # problem rather than a missing permission.
+#
+# This pair now applies to the CUSTOM-STAGE FALLBACK ONLY. Stages 1 and 3 of
+# the shipped pipeline are IaCM stages, and IaCM keeps state in the workspace,
+# on the platform — nothing writes a tfstate Secret into harness-builds on that
+# path. The Role and RoleBinding are harmless if left in place and are still
+# required by harness/custom-stages.yaml.example, so they stay.
 ###############################################################################
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -121,3 +127,129 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: ephemeral-db-tfstate
+---
+# ============================================================================
+# EVERYTHING BELOW THIS LINE IS COMMENTED OUT ON PURPOSE. Stop here for the
+# primary path — there is nothing left to do.
+# ============================================================================
+#
+# These manifests are commented out rather than merely labelled "optional"
+# because `kubectl apply -f` has no notion of optional: it applies every
+# document in the file. An earlier edition of this file left them live and told
+# the reader to "apply the file as it stands and skip this section entirely",
+# which is self-contradictory — following both halves of that sentence creates a
+# cluster-wide, never-expiring token on the primary path, where nothing can use
+# it. The grant below is the widest thing in this repo, so the default has to be
+# "absent", not "present but discouraged".
+#
+# To enable the Docker/Cloud fallback, uncomment from the ServiceAccount to the
+# end of the file and re-apply. That is the whole procedure.
+#
+###############################################################################
+# OPTIONAL — a named ServiceAccount with a long-lived token, for the
+# Docker/Cloud IaCM fallback ONLY.
+#
+# NOT NEEDED FOR THE PRIMARY PATH. With `infrastructure: type:
+# KubernetesDirect` the IaCM Terraform plugin runs in a build pod in this
+# cluster as the harness-builds 'default' ServiceAccount, which the
+# ClusterRoleBinding and RoleBinding above already bind. That is the
+# configuration proven on minikube — and since proven on app.harness.io, where
+# real IACM stages provisioned and destroyed the namespace with zero credential
+# configuration of any kind.
+#
+# WHY IT EXISTS: the Docker and Cloud IaCM runtimes run the plugin OUTSIDE the
+# cluster. There is no pod, so there is no mounted ServiceAccount token, so
+# there is nothing for `harness-builds:default` to present — that subject is a
+# pod identity and only a pod can use it. The credentials have to arrive as
+# KUBE_HOST / KUBE_CLUSTER_CA_CERT_DATA / KUBE_TOKEN instead, which means some
+# named identity has to own a token that can be read out and stored.
+#
+# THE TOKEN STORY, because this is where the time goes:
+#
+#   On Kubernetes 1.24+ creating a ServiceAccount no longer creates a token
+#   Secret for it. The obvious substitute, `kubectl create token`, defaults to
+#   EXACTLY one hour — measured, exp minus iat is 3600 — and says nothing about
+#   it. Paste that into a Harness secret and the pipeline works, then starts
+#   failing roughly an hour later with a bare `Error: Unauthorized`, which
+#   reads as broken RBAC or broken connectivity rather than an expired
+#   credential. Nobody debugs expiry on day two.
+#
+#   The Secret below is the fix: an explicit kubernetes.io/service-account-token
+#   Secret yields a token with no exp claim. Revoke it by deleting the Secret,
+#   or the ServiceAccount.
+#
+#   Do NOT reach for `kubectl create token --duration=8760h` instead. It is
+#   clamped by the apiserver's --service-account-max-token-expiration, which
+#   merely happened to be unset on the minikube this was tested against.
+#   Managed EKS/AKS/GKE control planes set it, and the clamp is silent.
+#
+# READING THE TOKEN OUT:
+#
+#   kubectl get secret ephemeral-db-provisioner-token -n harness-builds \
+#     -o jsonpath='{.data.token}' | base64 -d
+#
+#   That value goes into a Harness secret, which the IaCM workspace references
+#   as its KUBE_TOKEN environment variable. KUBE_CLUSTER_CA_CERT_DATA wants raw
+#   PEM, not base64 — see the provider comment in main.tf, which has the exact
+#   encodings and the misleading error you get for guessing wrong.
+#
+# SCOPE CONSEQUENCE, stated plainly: the ClusterRole bound below is
+# cluster-wide for apps/deployments and apps/deployments/scale, so this token
+# can scale and annotate deployments in ANY namespace, not only the ephemeral
+# database's. The in-cluster path does not need that reach — build-access.tf
+# narrows stage 2's wake step to one namespace — but there is no narrower
+# binding for the fallback to use. Treat the token accordingly.
+###############################################################################
+#apiVersion: v1
+#kind: ServiceAccount
+#metadata:
+#  name: ephemeral-db-provisioner
+#  namespace: harness-builds
+#---
+## Binds the EXISTING ClusterRole above. No new permissions are defined here;
+## this only gives the named ServiceAccount the same grants the build pods
+## already have, so the two paths cannot drift apart.
+#apiVersion: rbac.authorization.k8s.io/v1
+#kind: ClusterRoleBinding
+#metadata:
+#  name: ephemeral-db-provisioner-sa
+#subjects:
+#  - kind: ServiceAccount
+#    name: ephemeral-db-provisioner
+#    namespace: harness-builds
+#roleRef:
+#  apiGroup: rbac.authorization.k8s.io
+#  kind: ClusterRole
+#  name: ephemeral-db-provisioner
+#---
+## State access for the same subject. Only needed if this identity is also the
+## one running the Custom-stage fallback's `terraform init` against the
+## kubernetes backend; an IaCM Docker/Cloud workspace keeps state on the
+## platform and will never touch the tfstate Secret. Binding it costs nothing
+## and removes one class of confusing lock failure.
+#apiVersion: rbac.authorization.k8s.io/v1
+#kind: RoleBinding
+#metadata:
+#  name: ephemeral-db-tfstate-sa
+#  namespace: harness-builds
+#subjects:
+#  - kind: ServiceAccount
+#    name: ephemeral-db-provisioner
+#    namespace: harness-builds
+#roleRef:
+#  apiGroup: rbac.authorization.k8s.io
+#  kind: Role
+#  name: ephemeral-db-tfstate
+#---
+## The long-lived token. The annotation is what makes the control plane populate
+## .data.token; without it this is an empty opaque Secret of the wrong type and
+## nothing explains why.
+#apiVersion: v1
+#kind: Secret
+#metadata:
+#  name: ephemeral-db-provisioner-token
+#  namespace: harness-builds
+#  annotations:
+#    kubernetes.io/service-account.name: ephemeral-db-provisioner
+#type: kubernetes.io/service-account-token
+#
